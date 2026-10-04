@@ -12,10 +12,8 @@
 //! end of [`drive`] (§3/§6, P4), because a disappearance is only ever noticed by
 //! the *next* scan and the camera thread is about to have none.
 //!
-//! Known open item (§3): the store lock is taken coarsely, once per `step()`, so
-//! annotation + JPEG encoding of a new observation happen under it. Moving that
-//! work out needs `ingest_detections` to take the shared handle rather than a
-//! `&Store`.
+//! StoreAccess takes short DB-only locks; decoding, inference, annotation and
+//! raw asset publication never hold the shared database mutex.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -312,10 +310,7 @@ fn drive(
             publish!();
         }
 
-        let stepped = {
-            let store = store.lock().expect("store mutex poisoned");
-            runner.step(&store)
-        };
+        let stepped = runner.step(&store);
         publish!();
 
         match stepped {
@@ -425,6 +420,8 @@ mod tests {
             depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
+            snapshots: crate::config::SnapshotMode::First,
+            raw_assets: None,
             events_path: None,
             max_frames,
             enabled: true,

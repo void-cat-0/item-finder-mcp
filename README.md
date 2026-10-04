@@ -47,6 +47,149 @@ Crates, one-way dependencies (`item-ingest`/`item-query`/`item-web` -> `item-cor
   `/api/observation/{id}/snapshot`, `/api/geometry/{id}/snapshot`, `/api/ask`). Opens the same SQLite WAL file
   the daemon writes, read-only — no write path, no contention, no shared process.
 
+## MCP queries and camera frames (stdio)
+
+**crates/item-mcp** is a standalone MCP stdio server using the official `rmcp`
+SDK, locked to **3.5.1**. It exposes seven tools; `get_camera_frame` asks the daemon
+to save a temporary immutable image asset, while the other six tools are read-only:
+
+| Tool | Purpose |
+| --- | --- |
+| `server_info` | Check the connection; returns `mode: queries_and_camera_frames`, not database health. |
+| `list_recorded_items` | List actual recorded labels with observation counts, last seen time, cameras and zones. |
+| `locate_item` | Find an item's last direct sighting using an explicit label or an English keyword heuristic. |
+| `list_observations` | List sightings with optional label, camera, zone and last-seen time filters. |
+| `get_observation` | Read basic fields of one observation by ID. |
+| `get_item_images` | Read verified unannotated raw JPEGs, including unexpired camera frame assets, through the authenticated local daemon. |
+| `get_camera_frame` | Get a fresh cached camera frame and freeze it as an expiring raw asset, with capture time, age and hash. |
+
+The ingest daemon remains a separate process: it writes the observations;
+MCP opens that SQLite database **read-only** for each query. It never creates
+or migrates the database and does not start/stop cameras or the daemon. A missing
+or unreadable database produces a `database_unavailable` tool error, not an
+empty result. If ingest later creates the database, subsequent queries can
+read it without restarting MCP. Old observation-only schemas remain readable.
+
+The SDK declares Rust 1.88, but the locked `uuid` dependency requires 1.89;
+`item-mcp` declares **Rust >= 1.89** and is tested with stable Rust 1.98.1.
+No camera/model/FFmpeg setup is needed for the MCP process.
+
+```sh
+cargo +stable build -p item-mcp
+cargo +stable test -p item-mcp
+# Linux/macOS: the MCP host runs this command with JSON-RPC on stdin.
+./target/debug/item-mcp --stdio --db /absolute/path/to/data/items.db
+# Windows:
+./target/debug/item-mcp.exe --stdio --db C:/absolute/path/to/data/items.db
+```
+
+`--stdio` is optional. Database selection is `--db` > `ITEM_DB` > `data/items.db`;
+relative paths resolve against the process's startup cwd, so use an absolute
+path in a host configuration. Stdout contains only MCP messages, logs go to
+stderr, and closing stdin after initialization stops the server. Legacy
+initialize versions `2024-11-05`, `2025-03-26`, and `2025-11-25` are tested.
+
+For an unknown name (especially a Chinese question), call `list_recorded_items`
+first, then pass a recorded label to `locate_item`. `query` is a keyword
+heuristic, not translation or semantic search. For example:
+
+```json
+{"camera":"desk","limit":200}
+```
+
+is an input to `list_recorded_items`; after discovering `keys`, use:
+
+```json
+{"label":"keys","camera":"desk","zone":"tray","limit":20}
+```
+
+as input to `locate_item`. Explicit `label` takes priority over `query`.
+Observation lists accept literal label substrings (no wildcard/SQL syntax),
+exact camera/zone values, and inclusive RFC3339 `since`/`until` bounds on
+**last_seen**. Filters apply before the limit; results are newest first with
+an ID tie-break. Limits must be 1–500 (default 20 for observations, 200 for
+labels); inventory includes `truncated` when more labels match. Its count is
+observation rows, **not** frame hits. Empty matches are successful empty lists;
+invalid inputs and unknown IDs return `invalid_input` and `not_found` errors.
+
+Observation queries return historical direct sightings, **not current location/presence**.
+Labels may contain detector false positives. `get_item_images` reads raw evidence
+through the daemon. `get_camera_frame` returns the most recent frame within an
+explicit freshness limit; its capture time describes when the daemon received
+the frame, not the exact instant the MCP request was made. Inferred locations,
+evidence details, resources, prompts, annotation writes and daemon management
+are not registered yet. No local snapshot paths are exposed.
+
+To enable raw image reads, use a separate loopback listener in the ingest config:
+
+```toml
+[daemon]
+internal_listen = "127.0.0.1:8480"
+internal_max_asset_bytes = 8388608
+```
+
+Set a shared `ITEM_DAEMON_TOKEN` in the environment of both daemon and MCP.
+The daemon refuses to enable the internal listener without a token. Set
+`ITEM_DAEMON_ENDPOINT=http://127.0.0.1:8480` for MCP, or pass
+`--daemon-endpoint http://127.0.0.1:8480`. This HTTP API is separate from
+MCP's stdio transport and the Frigate webhook/preview listener.
+
+```json
+{"image_kind":"raw","observation_ids":[12],"max_images":4,"max_bytes_each":4194304}
+```
+
+The image tool returns structured metadata plus MCP image content; each
+`content_index` identifies the corresponding image block. Raw assets are
+unannotated captured RGB frames encoded as JPEG, persisted separately from
+existing detector snapshots. Historical snapshots and Frigate references do
+not gain raw provenance retroactively; missing raw returns `raw_unavailable`.
+The daemon owns raw publication, recovery and cleanup. MCP verifies the stable
+source identity of its `--db` against each daemon asset, so configure both to
+use the same dataset; different datasets return `dataset_mismatch`. A stopped daemon yields
+`daemon_unavailable` for images while SQLite history queries remain usable.
+For a current camera image, call `get_camera_frame` with the configured camera ID:
+
+```json
+{"camera_id":"laptop","max_age_ms":2000,"wait_timeout_ms":3000,"max_bytes":4194304}
+```
+
+The daemon caches the latest decoded RGB frame independently of detector results.
+A request freezes an eligible frame into an immutable JPEG asset; it does not open
+another camera connection, trigger detection or create an observation. If the
+cached frame is too old, the request waits up to `wait_timeout_ms` for a fresh
+frame. Offline cameras and expired frames produce explicit errors. The returned
+`asset_id` can be reread using `get_item_images` before `expires_at`; reading it
+does not refresh its lifetime. This limited daemon-side asset write is why
+`get_camera_frame` is not advertised as a read-only tool. Annotation submission
+is still unimplemented.
+
+See [the daemon asset API contract](docs/daemon-asset-api.md) for cache/asset
+lifetimes, limits, error semantics, identity/hash verification and configuration.
+
+In **ZCode Settings → MCP**, use the executable's absolute path and pass an
+absolute `--db`. Merge this example into `mcp.servers` without replacing other
+servers:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "item-finders-mcp": {
+        "type": "stdio",
+        "command": "C:/path/to/item-finders-mcp/target/debug/item-mcp.exe",
+        "args": ["--stdio", "--db", "C:/path/to/item-finders-mcp/data/items.db"]
+      }
+    }
+  }
+}
+```
+
+If Windows keeps a running MCP executable locked during a rebuild, build with
+`--target-dir target/mcp-query` and point the host at
+`target/mcp-query/debug/item-mcp.exe` instead. Reconnect/restart the host session
+to reload the executable and tool list. See [the MCP plan](docs/mcp-server-plan.md)
+for subsequent stages.
+
 ## Quick start
 
 ```sh

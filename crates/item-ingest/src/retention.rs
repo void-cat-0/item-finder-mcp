@@ -84,6 +84,7 @@ pub fn prune(
         ..Default::default()
     };
     remove_snapshots(snapshots_dir, expired, &mut report);
+    remove_expired_raw(store, snapshots_dir, &mut report)?;
     Ok(report)
 }
 
@@ -97,6 +98,8 @@ pub fn prune(
 /// database is far more likely to mean "wrong path" than "everything expired",
 /// and the safe direction is to keep files.
 pub fn reconcile(store: &SharedStore, snapshots_dir: &Path) -> anyhow::Result<SweepReport> {
+    let mut report = SweepReport::default();
+    remove_expired_raw(store, snapshots_dir, &mut report)?;
     let ids = {
         let store = store.lock().expect("store mutex poisoned");
         store.observation_ids()?
@@ -106,7 +109,7 @@ pub fn reconcile(store: &SharedStore, snapshots_dir: &Path) -> anyhow::Result<Sw
             dir = %snapshots_dir.display(),
             "orphan scan skipped: no observations to compare against"
         );
-        return Ok(SweepReport::default());
+        return Ok(report);
     };
     let live: HashSet<i64> = ids.into_iter().collect();
 
@@ -120,7 +123,6 @@ pub fn reconcile(store: &SharedStore, snapshots_dir: &Path) -> anyhow::Result<Sw
         }
     };
 
-    let mut report = SweepReport::default();
     let mut orphans = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("scanning {}", snapshots_dir.display()))?;
@@ -135,6 +137,30 @@ pub fn reconcile(store: &SharedStore, snapshots_dir: &Path) -> anyhow::Result<Sw
     tracing::debug!(orphans = orphans.len(), "orphan scan");
     remove_snapshots(snapshots_dir, orphans, &mut report);
     Ok(report)
+}
+
+fn remove_expired_raw(
+    store: &SharedStore,
+    root: &Path,
+    report: &mut SweepReport,
+) -> anyhow::Result<()> {
+    let _commit = crate::assets::RAW_LIFECYCLE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("raw lifecycle lock poisoned"))?;
+    for path in crate::assets::expired_raw_files(store, root)? {
+        match unlink(&path) {
+            Unlinked::Gone(bytes) => {
+                report.files_deleted += 1;
+                report.bytes_freed += bytes;
+            }
+            Unlinked::Missing => {}
+            Unlinked::Kept(error) => {
+                report.files_kept += 1;
+                tracing::warn!(error = %error, "raw file cleanup deferred");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Unlink one snapshot per id, recording what happened.
@@ -159,15 +185,19 @@ fn remove_snapshots(snapshots_dir: &Path, ids: Vec<i64>, report: &mut SweepRepor
     }
 }
 
-/// `<id>.jpg` -> the id it claims to be the snapshot of. Anything else in the
-/// directory (other extensions, non-numeric names, unreadable names) is not
-/// ours and is left alone.
+/// `<id>.jpg` or `<id>-<suffix>.jpg` -> the observation id it belongs to.
+/// Snapshot modes produce: `12.jpg` (first), `12-ev34.jpg` (events), `12-g56.jpg` (detections).
+/// Anything else in the directory (other extensions, non-numeric prefix, unreadable names)
+/// is not ours and is left alone.
 fn orphan_candidate(name: &std::ffi::OsStr) -> Option<i64> {
-    name.to_str()?
-        .strip_suffix(".jpg")?
-        .parse::<i64>()
-        .ok()
-        .filter(|id| *id > 0)
+    let s = name.to_str()?.strip_suffix(".jpg")?;
+    // Try to parse the whole name as a number first (backward compat with "12.jpg")
+    if let Ok(id) = s.parse::<i64>() {
+        return (id > 0).then_some(id);
+    }
+    // Otherwise try to parse the prefix before the first dash ("12-ev34" -> "12")
+    let prefix = s.split('-').next()?;
+    prefix.parse::<i64>().ok().filter(|id| *id > 0)
 }
 
 /// What happened to one file.
@@ -442,10 +472,18 @@ mod tests {
     #[test]
     fn orphan_candidates_are_strictly_ours() {
         assert_eq!(orphan_candidate("12.jpg".as_ref()), Some(12));
+        assert_eq!(orphan_candidate("12-ev34.jpg".as_ref()), Some(12));
+        assert_eq!(orphan_candidate("12-g56.jpg".as_ref()), Some(12));
         assert_eq!(orphan_candidate("0.jpg".as_ref()), None, "ids start at 1");
+        assert_eq!(orphan_candidate("0-ev1.jpg".as_ref()), None);
         assert_eq!(orphan_candidate("12.JPG".as_ref()), None);
         assert_eq!(orphan_candidate("12.png".as_ref()), None);
         assert_eq!(orphan_candidate("snapshot-12.jpg".as_ref()), None);
         assert_eq!(orphan_candidate(".jpg".as_ref()), None);
+        assert_eq!(
+            orphan_candidate("ev34-12.jpg".as_ref()),
+            None,
+            "id must be prefix"
+        );
     }
 }

@@ -50,6 +50,33 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+/// How much to save for each detection: off (no snapshots), first (one JPEG
+/// when an observation opens), events (first + one JPEG per appeared/disappeared
+/// event), or detections (events + one JPEG per detection that updates an
+/// observation). Default: first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotMode {
+    Off,
+    #[default]
+    First,
+    Events,
+    Detections,
+}
+
+impl SnapshotMode {
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "first" => Ok(Self::First),
+            "events" => Ok(Self::Events),
+            "detections" => Ok(Self::Detections),
+            _ => Err(ConfigError::Invalid(format!(
+                "snapshots mode must be off, first, events, or detections; got '{s}'"
+            ))),
+        }
+    }
+}
+
 use crate::runtime::{CameraTask, DetectorSpec, SourceSpec};
 
 /// Built-in defaults: the lowest-precedence layer of the merge.
@@ -98,10 +125,12 @@ pub struct Config {
     pub camera: Vec<CameraConfig>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 pub struct DaemonConfig {
     pub db: Option<String>,
     pub snapshots_dir: Option<String>,
+    /// Snapshot mode: "off", "first", "events", or "detections" (default: "first").
+    pub snapshots: Option<String>,
     pub health_file: Option<String>,
     /// Where the appeared/disappeared timeline is appended; `""` = produce no
     /// events (docs/resident-ingest.md §6).
@@ -116,6 +145,16 @@ pub struct DaemonConfig {
     pub sweep_secs: Option<u64>,
     /// How often to scan the snapshots directory for orphan files; 0 = never.
     pub reconcile_secs: Option<u64>,
+    /// Optional loopback-only daemon asset API listener, e.g. 127.0.0.1:8480.
+    pub internal_listen: Option<String>,
+    /// Bearer token for the internal asset API. Required when the listener is enabled.
+    pub internal_token: Option<String>,
+    /// Maximum raw asset size served by the internal API.
+    pub internal_max_asset_bytes: Option<u64>,
+    /// Latest camera-frame cache lifetime in milliseconds (1..=5000).
+    pub frame_cache_ttl_ms: Option<u64>,
+    /// Frozen camera-frame asset lifetime in seconds (1..=86400).
+    pub frame_asset_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -230,6 +269,8 @@ impl Config {
                     .expect("depth configuration must be validated before camera_tasks"),
                 detect_fps: settings.detect_fps_for(Some(cam)),
                 snapshot_dir: PathBuf::from(&settings.snapshots_dir),
+                snapshots: settings.snapshots,
+                raw_assets: None,
                 events_path: settings.events_path(),
                 max_frames: 0,
                 enabled: true,
@@ -244,6 +285,7 @@ impl Config {
 pub struct CliOverrides {
     pub db: Option<String>,
     pub snapshots_dir: Option<String>,
+    pub snapshots: Option<String>,
     pub listen: Option<String>,
     pub camera_id: Option<String>,
     pub detector: Option<String>,
@@ -265,8 +307,9 @@ pub struct CliOverrides {
 
 /// The environment layer. Same two variables item-web's ask bar reads, so one
 /// shell setup can drive both sides.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct EnvOverrides {
+    pub internal_token: Option<String>,
     pub vlm_base_url: Option<String>,
     pub vlm_model: Option<String>,
     pub depth_base_url: Option<String>,
@@ -276,6 +319,7 @@ pub struct EnvOverrides {
 impl EnvOverrides {
     pub fn from_env() -> Self {
         Self {
+            internal_token: std::env::var("ITEM_DAEMON_TOKEN").ok(),
             vlm_base_url: std::env::var("ITEM_VLM_BASE_URL").ok(),
             vlm_model: std::env::var("ITEM_VLM_MODEL").ok(),
             // ITEM_VLM_* is a compatibility fallback for the depth backend;
@@ -291,10 +335,11 @@ impl EnvOverrides {
 }
 
 /// The resolved settings: pure data, safe to log, safe to unit-test.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub db: String,
     pub snapshots_dir: String,
+    pub snapshots: SnapshotMode,
     pub health_file: String,
     /// The appeared/disappeared timeline path; empty string = off (§6).
     pub events_file: String,
@@ -307,6 +352,11 @@ pub struct RuntimeConfig {
     pub sweep_secs: u64,
     /// How often to look for orphan snapshot files; 0 = never.
     pub reconcile_secs: u64,
+    pub internal_listen: Option<String>,
+    pub internal_token: Option<String>,
+    pub internal_max_asset_bytes: u64,
+    pub frame_cache_ttl_ms: u64,
+    pub frame_asset_ttl_secs: u64,
     pub webhook_enabled: bool,
     pub listen: String,
     /// `None` = the preview endpoint stays off.
@@ -335,12 +385,70 @@ pub struct RuntimeConfig {
     pub vlm_coords: String,
 }
 
+// Redacted Debug is deliberate: resolved config is often printed in diagnostics.
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RuntimeConfig { redacted }")
+    }
+}
+impl std::fmt::Debug for DaemonConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DaemonConfig { redacted }")
+    }
+}
+impl std::fmt::Debug for EnvOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvOverrides { redacted }")
+    }
+}
+
 impl RuntimeConfig {
     /// Validate provider names and values before any database or camera work.
     pub fn validate(&self, file: Option<&Config>) -> Result<(), String> {
+        if let Some(listen) = &self.internal_listen {
+            let addr: std::net::SocketAddr = listen
+                .parse()
+                .map_err(|_| "internal_listen must be a valid socket address".to_string())?;
+            if !addr.ip().is_loopback() {
+                return Err("internal_listen must bind to a loopback address".into());
+            }
+            if self.internal_token.as_deref().is_none_or(|token| {
+                token.trim().is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            }) {
+                return Err("ITEM_DAEMON_TOKEN (or internal_token) is required when internal_listen is enabled and must contain visible ASCII".into());
+            }
+        }
+        if self.internal_max_asset_bytes == 0
+            || self.internal_max_asset_bytes > crate::assets::DEFAULT_MAX_ASSET_BYTES
+        {
+            return Err("internal_max_asset_bytes must be between 1 and 8388608".into());
+        }
+        if !(1..=5000).contains(&self.frame_cache_ttl_ms) {
+            return Err("frame_cache_ttl_ms must be between 1 and 5000".into());
+        }
+        if !(1..=86400).contains(&self.frame_asset_ttl_secs) {
+            return Err("frame_asset_ttl_secs must be between 1 and 86400".into());
+        }
+        if self.webhook_enabled {
+            self.listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| "bad webhook listen address".to_string())?;
+        }
         self.depth_spec_for(None).map_err(|e| e.to_string())?;
         if let Some(file) = file {
+            let mut ids = std::collections::HashSet::new();
             for camera in &file.camera {
+                if camera.id.is_empty()
+                    || camera.id.len() > 1024
+                    || camera.id == "."
+                    || camera.id == ".."
+                    || camera.id.chars().any(|c| c.is_control())
+                {
+                    return Err(format!("camera '{}' has an invalid id", camera.id));
+                }
+                if !ids.insert(camera.id.as_str()) {
+                    return Err(format!("duplicate camera id '{}'", camera.id));
+                }
                 self.depth_spec_for(Some(camera))
                     .map_err(|e| format!("camera '{}': {e}", camera.id))?;
             }
@@ -355,7 +463,11 @@ impl RuntimeConfig {
     /// changing it under an existing command line would rewrite where
     /// observations land. A `[[camera]]` row is consulted only once the id is
     /// known, to pick up that camera's `detector`/`detect_fps`/`targets`.
-    pub fn resolve(file: Option<&Config>, cli: &CliOverrides, env: &EnvOverrides) -> Self {
+    pub fn resolve(
+        file: Option<&Config>,
+        cli: &CliOverrides,
+        env: &EnvOverrides,
+    ) -> Result<Self, ConfigError> {
         let daemon = file.map(|c| &c.daemon);
         let webhook = file.map(|c| &c.webhook);
         let row = cli
@@ -382,13 +494,21 @@ impl RuntimeConfig {
         let depth_base_url_env = depth_env_base_url.is_some();
         let depth_model_env = depth_env_model.is_some();
 
-        Self {
+        Ok(Self {
             db: take(&cli.db, daemon.and_then(|d| d.db.as_deref()), defaults::DB),
             snapshots_dir: take(
                 &cli.snapshots_dir,
                 daemon.and_then(|d| d.snapshots_dir.as_deref()),
                 defaults::SNAPSHOTS_DIR,
             ),
+            snapshots: {
+                let raw = cli
+                    .snapshots
+                    .as_deref()
+                    .or_else(|| daemon.and_then(|d| d.snapshots.as_deref()))
+                    .unwrap_or("first");
+                SnapshotMode::parse(raw)?
+            },
             health_file: daemon
                 .and_then(|d| d.health_file.clone())
                 .unwrap_or_else(|| defaults::HEALTH_FILE.to_string()),
@@ -408,6 +528,19 @@ impl RuntimeConfig {
             reconcile_secs: daemon
                 .and_then(|d| d.reconcile_secs)
                 .unwrap_or(defaults::RECONCILE_SECS),
+            internal_listen: daemon
+                .and_then(|d| d.internal_listen.clone())
+                .filter(|value| !value.trim().is_empty()),
+            internal_token: env
+                .internal_token
+                .clone()
+                .or_else(|| daemon.and_then(|d| d.internal_token.clone()))
+                .filter(|value| !value.is_empty()),
+            internal_max_asset_bytes: daemon
+                .and_then(|d| d.internal_max_asset_bytes)
+                .unwrap_or(crate::assets::DEFAULT_MAX_ASSET_BYTES),
+            frame_cache_ttl_ms: daemon.and_then(|d| d.frame_cache_ttl_ms).unwrap_or(5000),
+            frame_asset_ttl_secs: daemon.and_then(|d| d.frame_asset_ttl_secs).unwrap_or(600),
             webhook_enabled: webhook.and_then(|w| w.enabled).unwrap_or(true),
             listen: take(
                 &cli.listen,
@@ -476,7 +609,7 @@ impl RuntimeConfig {
                 .vlm_coords
                 .clone()
                 .unwrap_or_else(|| defaults::VLM_COORDS.to_string()),
-        }
+        })
     }
 
     /// How often detection runs: an explicit value wins; otherwise 0.2 for the
@@ -717,7 +850,7 @@ desk = [100.0, 100.0, 700.0, 400.0]
 
     #[test]
     fn an_empty_config_reproduces_the_historical_cli_defaults() {
-        let cfg = RuntimeConfig::resolve(None, &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(None, &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.db, "data/items.db");
         assert_eq!(cfg.snapshots_dir, "data/snapshots");
         assert_eq!(cfg.health_file, "data/health.json");
@@ -759,7 +892,7 @@ desk = [100.0, 100.0, 700.0, 400.0]
 events_file = ""
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(
             cfg.events_path(),
             None,
@@ -782,7 +915,8 @@ events_file = ""
 events_file = "logs/events.jsonl"
 "#,
         );
-        let mut cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let mut cfg =
+            RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         cfg.absolutize(Path::new("/base"));
         assert!(
             cfg.events_path().unwrap().is_absolute(),
@@ -815,7 +949,7 @@ detect_fps = 0.5
 targets = "keys,wallet"
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.db, "from-file.db");
         assert_eq!(cfg.snapshots_dir, "from-file-snaps");
         assert_eq!(cfg.health_file, "from-file-health.json");
@@ -845,7 +979,7 @@ sweep_secs = 0
 reconcile_secs = 0
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.retention_window(), None);
         assert_eq!(cfg.sweep_secs, 0, "0 is a value, not 'unset'");
         assert_eq!(cfg.reconcile_secs, 0);
@@ -877,7 +1011,7 @@ detect_fps = 0.5
             detect_fps: Some(3.0),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.db, "from-cli.db");
         assert_eq!(cfg.snapshots_dir, "from-cli-snaps");
         assert_eq!(cfg.listen, "127.0.0.1:1234");
@@ -904,7 +1038,7 @@ detector = "yolo"
             camera_id: Some("living".into()),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.camera_id, "living");
         assert_eq!(cfg.detector, "vlm");
         assert_eq!(cfg.detect_fps(), 0.5);
@@ -915,7 +1049,7 @@ detector = "yolo"
             camera_id: Some("nope".into()),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli, &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.detector, "yolo");
         assert_eq!(cfg.detect_fps(), 1.0);
     }
@@ -928,7 +1062,7 @@ detector = "yolo"
 id = "living"
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(
             cfg.camera_id, "rtsp-0",
             "identity must stay stable for an unchanged command line"
@@ -961,7 +1095,7 @@ webcam = 2
 id = "fed-by-frigate"
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         let tasks = file.camera_tasks(&cfg);
 
         let by_id = |id: &str| {
@@ -997,14 +1131,49 @@ id = "fed-by-frigate"
     }
 
     #[test]
+    fn internal_token_env_precedence_validation_and_debug_are_safe() {
+        let file = parse(
+            r#"
+[daemon]
+internal_listen = "127.0.0.1:8480"
+internal_token = "file-secret"
+"#,
+        );
+        let env = EnvOverrides {
+            internal_token: Some("env-secret".into()),
+            ..Default::default()
+        };
+        let settings = RuntimeConfig::resolve(Some(&file), &cli(), &env).unwrap();
+        assert_eq!(settings.internal_token.as_deref(), Some("env-secret"));
+        assert!(settings.validate(Some(&file)).is_ok());
+        for text in [
+            format!("{file:?}"),
+            format!("{settings:?}"),
+            format!("{env:?}"),
+        ] {
+            assert!(!text.contains("file-secret"));
+            assert!(!text.contains("env-secret"));
+        }
+        for invalid in ["", "   ", "bad\r\ntoken", "spaced token"] {
+            let env = EnvOverrides {
+                internal_token: Some(invalid.into()),
+                ..Default::default()
+            };
+            let settings = RuntimeConfig::resolve(Some(&file), &cli(), &env).unwrap();
+            assert!(settings.validate(Some(&file)).is_err());
+        }
+    }
+
+    #[test]
     fn env_sits_between_file_and_cli() {
         let env = EnvOverrides {
+            internal_token: None,
             vlm_base_url: Some("http://from-env/v1".into()),
             vlm_model: Some("from-env-model".into()),
             depth_base_url: None,
             depth_model: None,
         };
-        let cfg = RuntimeConfig::resolve(None, &cli(), &env);
+        let cfg = RuntimeConfig::resolve(None, &cli(), &env).unwrap();
         assert_eq!(cfg.vlm_base_url.as_deref(), Some("http://from-env/v1"));
         assert_eq!(cfg.vlm_model.as_deref(), Some("from-env-model"));
 
@@ -1013,7 +1182,7 @@ id = "fed-by-frigate"
             vlm_model: Some("from-cli-model".into()),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(None, &cli, &env);
+        let cfg = RuntimeConfig::resolve(None, &cli, &env).unwrap();
         assert_eq!(cfg.vlm_base_url.as_deref(), Some("http://from-cli/v1"));
         assert_eq!(cfg.vlm_model.as_deref(), Some("from-cli-model"));
     }
@@ -1024,14 +1193,14 @@ id = "fed-by-frigate"
             detector: Some("vlm".into()),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(None, &cli, &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(None, &cli, &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.detect_fps(), 0.2);
 
         let cli = CliOverrides {
             detector: Some("yolo".into()),
             ..Default::default()
         };
-        let cfg = RuntimeConfig::resolve(None, &cli, &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(None, &cli, &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.detect_fps(), 1.0);
     }
 
@@ -1056,11 +1225,12 @@ depth_timeout = 10
             ..Default::default()
         };
         let env = EnvOverrides {
+            internal_token: None,
             depth_base_url: Some("http://env/v1".into()),
             depth_model: Some("env-model".into()),
             ..Default::default()
         };
-        let settings = RuntimeConfig::resolve(Some(&file), &cli, &env);
+        let settings = RuntimeConfig::resolve(Some(&file), &cli, &env).unwrap();
         assert!(matches!(
             settings.depth_spec_for(Some(&file.camera[0])).unwrap(),
             crate::runtime::DepthSpec::RelativeVlm { base_url, model, timeout }
@@ -1077,7 +1247,8 @@ id = "cam"
 depth_provider = "made-up"
 "#,
         );
-        let settings = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let settings =
+            RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert!(settings.validate(Some(&file)).is_err());
         let file = parse(
             r#"
@@ -1089,7 +1260,8 @@ depth_model = "m"
 depth_timeout = 0
 "#,
         );
-        let settings = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let settings =
+            RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert!(settings.validate(Some(&file)).is_err());
     }
 
@@ -1101,7 +1273,7 @@ depth_timeout = 0
 preview_url = ""
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.preview_url, None);
 
         let file = parse(
@@ -1110,7 +1282,7 @@ preview_url = ""
 preview_url = "rtsp://cam/stream"
 "#,
         );
-        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default());
+        let cfg = RuntimeConfig::resolve(Some(&file), &cli(), &EnvOverrides::default()).unwrap();
         assert_eq!(cfg.preview_url.as_deref(), Some("rtsp://cam/stream"));
     }
 }

@@ -58,6 +58,62 @@ fn like_literal(text: &str) -> String {
         .replace('_', "\\_")
 }
 
+#[derive(Debug, Clone)]
+pub struct ObservationFilter {
+    pub label: Option<String>,
+    pub camera: Option<String>,
+    pub zone: Option<String>,
+    /// Inclusive UTC bounds on the last actual sighting, not the whole span.
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: i64,
+}
+
+impl Default for ObservationFilter {
+    fn default() -> Self {
+        Self {
+            label: None,
+            camera: None,
+            zone: None,
+            since: None,
+            until: None,
+            limit: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedItemsFilter {
+    pub camera: Option<String>,
+    pub zone: Option<String>,
+    pub limit: i64,
+}
+
+impl Default for RecordedItemsFilter {
+    fn default() -> Self {
+        Self {
+            camera: None,
+            zone: None,
+            limit: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedItemSummary {
+    pub label: String,
+    pub observation_count: i64,
+    pub last_seen: DateTime<Utc>,
+    pub cameras: Vec<String>,
+    pub zones: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedItemsPage {
+    pub items: Vec<RecordedItemSummary>,
+    pub truncated: bool,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -92,6 +148,66 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(Self { conn })
+    }
+
+    /// Opt-in writer operation for daemon raw assets. Does not alter the
+    /// observation schema version, and is never called by a read-only adapter.
+    pub fn ensure_database_identity(&self) -> Result<String> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS asset_database_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                database_id TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO asset_database_identity(singleton, database_id)
+             VALUES (1, lower(hex(randomblob(32))));",
+        )?;
+        let id: String = tx.query_row(
+            "SELECT database_id FROM asset_database_identity WHERE singleton = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(StoreError::InvalidInput(
+                "invalid database asset identity".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Read existing identity without creating tables or migrating a legacy DB.
+    pub fn database_identity(&self) -> Result<Option<String>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='asset_database_identity')",
+            [], |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT database_id FROM asset_database_identity WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if id.as_ref().is_some_and(|id| {
+            id.len() != 64
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(StoreError::InvalidInput(
+                "invalid database asset identity".into(),
+            ));
+        }
+        Ok(id)
     }
 
     /// `PRAGMA user_version`: 2 once lifecycle/geometry evidence exists. A
@@ -473,6 +589,15 @@ impl Store {
         Ok(())
     }
 
+    /// Attach a snapshot to a geometry sample (for event or per-detection snapshots).
+    pub fn update_geometry_snapshot(&self, geometry_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE observation_geometry SET snapshot_ref = ?2 WHERE id = ?1",
+            params![geometry_id, path],
+        )?;
+        Ok(())
+    }
+
     /// The stored snapshot path of one observation, if any. The web layer
     /// resolves it to a file; `frigate://` refs come back verbatim.
     ///
@@ -499,52 +624,116 @@ impl Store {
     /// `LIMIT -1` as "no limit", which would turn a typo into a full table
     /// dump -- and at most [`MAX_LIMIT`].
     pub fn recent(&self, label_like: Option<&str>, limit: i64) -> Result<Vec<Observation>> {
-        let limit = limit.clamp(1, MAX_LIMIT);
-        let pattern = label_like.map(like_literal);
-        let sql = if pattern.is_some() {
-            "SELECT id, camera_id, zone, label, first_seen, last_seen, hit_count, sample_snapshot
-             FROM observations
-             WHERE label LIKE '%' || ?2 || '%' ESCAPE '\\'
-             ORDER BY last_seen DESC LIMIT ?1"
-        } else {
-            "SELECT id, camera_id, zone, label, first_seen, last_seen, hit_count, sample_snapshot
-             FROM observations
-             ORDER BY last_seen DESC LIMIT ?1"
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let map = |r: &rusqlite::Row| -> rusqlite::Result<Observation> {
-            Ok(Observation {
-                id: r.get(0)?,
-                camera_id: r.get(1)?,
-                zone: r.get(2)?,
-                label: r.get(3)?,
-                first_seen: parse_ts(&r.get::<_, String>(4)?)?,
-                last_seen: parse_ts(&r.get::<_, String>(5)?)?,
-                hit_count: r.get(6)?,
-                sample_snapshot: r.get(7)?,
-            })
-        };
-        let rows = match &pattern {
-            Some(p) => stmt.query_map(params![limit, p], &map),
-            None => stmt.query_map(params![limit], &map),
-        }?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        return Ok(out);
+        self.observations_filtered(&ObservationFilter {
+            label: label_like.map(str::to_owned),
+            limit,
+            ..Default::default()
+        })
+    }
 
-        fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
-            DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
+    /// Filters apply before the limit. Time bounds refer to last_seen and accept
+    /// equivalent RFC3339 offsets already stored by older ingest versions.
+    pub fn observations_filtered(&self, filter: &ObservationFilter) -> Result<Vec<Observation>> {
+        if matches!((&filter.since, &filter.until), (Some(since), Some(until)) if since > until) {
+            return Err(StoreError::InvalidInput("since is later than until".into()));
         }
+        let pattern = filter.label.as_deref().map(like_literal);
+        let since = filter.since.map(|date| date.to_rfc3339());
+        let until = filter.until.map(|date| date.to_rfc3339());
+        let mut stmt = self.conn.prepare(
+            "SELECT id, camera_id, zone, label, first_seen, last_seen, hit_count, sample_snapshot
+             FROM observations
+             WHERE (?1 IS NULL OR label LIKE '%' || ?1 || '%' ESCAPE '\\')
+               AND (?2 IS NULL OR camera_id = ?2)
+               AND (?3 IS NULL OR zone = ?3)
+               AND (?4 IS NULL OR julianday(last_seen) >= julianday(?4))
+               AND (?5 IS NULL OR julianday(last_seen) <= julianday(?5))
+             ORDER BY julianday(last_seen) DESC, id DESC LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                pattern,
+                filter.camera,
+                filter.zone,
+                since,
+                until,
+                filter.limit.clamp(1, MAX_LIMIT)
+            ],
+            observation_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn observation_by_id(&self, id: i64) -> Result<Option<Observation>> {
+        if id <= 0 {
+            return Err(StoreError::InvalidInput(
+                "observation id must be positive".into(),
+            ));
+        }
+        Ok(self.conn.query_row(
+            "SELECT id, camera_id, zone, label, first_seen, last_seen, hit_count, sample_snapshot
+             FROM observations WHERE id = ?1",
+            params![id],
+            observation_row,
+        ).optional()?)
+    }
+
+    /// Aggregate the full filtered observation log, not a recent-row sample.
+    /// Distinct labels retain their original spelling and case.
+    pub fn recorded_items(&self, filter: &RecordedItemsFilter) -> Result<RecordedItemsPage> {
+        let limit = filter.limit.clamp(1, MAX_LIMIT) as usize;
+        let tx = self.conn.unchecked_transaction()?;
+        let summaries = {
+            let mut stmt = tx.prepare(
+                "SELECT label, COUNT(*) FROM observations
+                 WHERE (?1 IS NULL OR camera_id = ?1) AND (?2 IS NULL OR zone = ?2)
+                 GROUP BY label
+                 ORDER BY MAX(julianday(last_seen)) DESC, label ASC LIMIT ?3",
+            )?;
+            stmt.query_map(
+                params![filter.camera, filter.zone, limit as i64 + 1],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let truncated = summaries.len() > limit;
+        let mut items = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT camera_id, zone, last_seen FROM observations
+                 WHERE label = ?1 AND (?2 IS NULL OR camera_id = ?2) AND (?3 IS NULL OR zone = ?3)
+                 ORDER BY julianday(last_seen) DESC, id DESC",
+            )?;
+            for (label, observation_count) in summaries.into_iter().take(limit) {
+                let mut cameras = std::collections::BTreeSet::new();
+                let mut zones = std::collections::BTreeSet::new();
+                let mut last_seen = None;
+                let rows = stmt.query_map(params![label, filter.camera, filter.zone], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        parse_ts_value(row.get(2)?)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (camera, zone, seen) = row?;
+                    last_seen.get_or_insert(seen);
+                    cameras.insert(camera);
+                    zones.insert(zone);
+                }
+                let last_seen = last_seen
+                    .ok_or_else(|| StoreError::InvalidInput("inventory row disappeared".into()))?;
+                items.push(RecordedItemSummary {
+                    label,
+                    observation_count,
+                    last_seen,
+                    cameras: cameras.into_iter().collect(),
+                    zones: zones.into_iter().collect(),
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(RecordedItemsPage { items, truncated })
     }
 
     // ---- geometry and lifecycle evidence -----------------------------------
@@ -1299,6 +1488,19 @@ fn parse_ts_value(s: String) -> rusqlite::Result<DateTime<Utc>> {
         })
 }
 
+fn observation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Observation> {
+    Ok(Observation {
+        id: r.get(0)?,
+        camera_id: r.get(1)?,
+        zone: r.get(2)?,
+        label: r.get(3)?,
+        first_seen: parse_ts_value(r.get(4)?)?,
+        last_seen: parse_ts_value(r.get(5)?)?,
+        hit_count: r.get(6)?,
+        sample_snapshot: r.get(7)?,
+    })
+}
+
 fn geometry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationGeometry> {
     Ok(ObservationGeometry {
         id: r.get(0)?,
@@ -1363,6 +1565,173 @@ mod tests {
 
     fn ts(mins: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 2, 10, mins, 0).unwrap()
+    }
+
+    fn insert_query_row(
+        store: &Store,
+        camera: &str,
+        zone: &str,
+        label: &str,
+        seen: &str,
+        hits: i64,
+    ) -> i64 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO observations (camera_id,zone,label,first_seen,last_seen,hit_count)
+             VALUES (?1,?2,?3,?4,?4,?5)",
+                params![camera, zone, label, seen, hits],
+            )
+            .unwrap();
+        store.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn database_identity_is_opt_in_stable_and_database_specific() {
+        let first = Store::in_memory().unwrap();
+        let second = Store::in_memory().unwrap();
+        assert_eq!(first.database_identity().unwrap(), None);
+        let schema = first.schema_version().unwrap();
+        let id = first.ensure_database_identity().unwrap();
+        assert_eq!(id.len(), 64);
+        assert_eq!(first.ensure_database_identity().unwrap(), id);
+        assert_eq!(first.database_identity().unwrap(), Some(id.clone()));
+        assert_ne!(second.ensure_database_identity().unwrap(), id);
+        assert_eq!(first.schema_version().unwrap(), schema);
+        first.conn.pragma_update(None, "query_only", true).unwrap();
+        assert_eq!(first.database_identity().unwrap(), Some(id));
+        assert!(first.ensure_database_identity().is_err());
+    }
+
+    #[test]
+    fn filtered_observations_apply_filters_before_limit_and_use_time_offsets() {
+        let store = Store::in_memory().unwrap();
+        let target = insert_query_row(
+            &store,
+            "desk",
+            "tray",
+            "keys_50%",
+            "2026-09-02T11:00:00+01:00",
+            3,
+        );
+        insert_query_row(
+            &store,
+            "desk",
+            "elsewhere",
+            "keys_50%",
+            "2026-09-02T12:00:00Z",
+            1,
+        );
+        insert_query_row(
+            &store,
+            "other",
+            "tray",
+            "keys_50%",
+            "2026-09-02T13:00:00Z",
+            1,
+        );
+        insert_query_row(
+            &store,
+            "desk",
+            "tray",
+            "keysx50zz",
+            "2026-09-02T14:00:00Z",
+            1,
+        );
+        let filter = ObservationFilter {
+            label: Some("_50%".into()),
+            camera: Some("desk".into()),
+            zone: Some("tray".into()),
+            since: Some(ts(0)),
+            until: Some(ts(0)),
+            limit: 1,
+        };
+        let rows = store.observations_filtered(&filter).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, target);
+        assert_eq!(rows[0].last_seen, ts(0));
+        assert!(
+            store
+                .observations_filtered(&ObservationFilter {
+                    since: Some(ts(1)),
+                    until: Some(ts(0)),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn basic_observation_lookup_is_stable_and_does_not_hide_errors() {
+        let store = Store::in_memory().unwrap();
+        let first = insert_query_row(&store, "desk", "tray", "keys", "2026-09-02T10:00:00Z", 3);
+        let second = insert_query_row(
+            &store,
+            "desk",
+            "tray",
+            "cup",
+            "2026-09-02T10:00:00+00:00",
+            1,
+        );
+        assert_eq!(
+            store
+                .recent(None, 2)
+                .unwrap()
+                .iter()
+                .map(|o| o.id)
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        let row = store.observation_by_id(first).unwrap().unwrap();
+        assert_eq!(row.label, "keys");
+        assert_eq!(row.hit_count, 3);
+        assert!(store.observation_by_id(999).unwrap().is_none());
+        assert!(store.observation_by_id(0).is_err());
+        store.conn.execute_batch("DROP TABLE observations").unwrap();
+        assert!(store.observation_by_id(first).is_err());
+    }
+
+    #[test]
+    fn inventory_aggregates_all_rows_then_limits_labels_and_counts_observations() {
+        let store = Store::in_memory().unwrap();
+        for _ in 0..510 {
+            insert_query_row(&store, "desk", "tray", "keys", "2026-09-02T10:00:00Z", 10);
+        }
+        insert_query_row(&store, "hall", "shelf", "keys", "2026-09-02T10:01:00Z", 100);
+        insert_query_row(&store, "hall", "shelf", "Keys", "2026-09-02T10:00:00Z", 1);
+        let page = store
+            .recorded_items(&RecordedItemsFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.items[0].label, "keys");
+        assert_eq!(page.items[0].observation_count, 511);
+        assert_eq!(page.items[0].cameras, vec!["desk", "hall"]);
+        assert_eq!(page.items[0].zones, vec!["shelf", "tray"]);
+        assert_eq!(page.items[0].last_seen, ts(1));
+        let page = store
+            .recorded_items(&RecordedItemsFilter {
+                camera: Some("desk".into()),
+                zone: Some("tray".into()),
+                limit: 1,
+            })
+            .unwrap();
+        assert!(!page.truncated);
+        assert_eq!(page.items[0].observation_count, 510);
+        let all = store
+            .recorded_items(&RecordedItemsFilter::default())
+            .unwrap();
+        assert_eq!(all.items.len(), 2, "case variants remain original labels");
+        let empty = store
+            .recorded_items(&RecordedItemsFilter {
+                camera: Some("missing".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(empty.items.is_empty());
+        assert!(!empty.truncated);
     }
 
     #[test]

@@ -8,11 +8,13 @@
 //! already done decode+detect, we only deduplicate and persist its events.
 
 pub mod annotate;
+pub mod assets;
 pub mod config;
 pub mod daemon;
 pub mod depth;
 pub mod detector;
 pub mod events;
+pub mod frame_cache;
 pub mod frigate;
 pub mod health;
 pub mod lock;
@@ -67,21 +69,21 @@ pub struct Recorded {
 }
 
 /// Persist one frame's detections: NMS them, map centers to zones, record.
-/// When `frame_rgb` + `snapshots_dir` are provided and a sighting opens a NEW
-/// observation, the frame is annotated (all surviving boxes in label colors,
-/// zone rects dashed) and JPEG-encoded to `{dir}/{obs_id}.jpg` -- one
-/// representative image per observation, written once. Boxes live in the
-/// pixels only; the database stays detection-free.
+/// When `frame_rgb` + `snapshots_dir` are provided, snapshots are written
+/// according to `snapshot_mode`: `Off` = none, `First` = one per new observation,
+/// `Events` = First + one per event (written by runner), `Detections` = Events +
+/// one per detection. Boxes live in pixels only; the database stays detection-free.
 ///
 /// Returns one [`Recorded`] per surviving detection, in NMS order -- the count
 /// is `len()`, and the identities are what the event log is built from.
 pub fn ingest_detections(
-    store: &Store,
+    store: &impl StoreAccess,
     meta: &FrameMeta,
     dets: &[Detection],
     nms_iou_threshold: f32,
     min_confidence: f32,
     frame_rgb: Option<(&[u8], &std::path::Path)>,
+    snapshot_mode: crate::config::SnapshotMode,
 ) -> Result<Vec<Recorded>> {
     ingest_detections_with_depth(
         store,
@@ -90,7 +92,9 @@ pub fn ingest_detections(
         nms_iou_threshold,
         min_confidence,
         frame_rgb,
+        snapshot_mode,
         &[],
+        None,
         None,
         None,
     )
@@ -98,36 +102,53 @@ pub fn ingest_detections(
 
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_detections_with_depth(
-    store: &Store,
+    store: &impl StoreAccess,
     meta: &FrameMeta,
     dets: &[Detection],
     nms_iou_threshold: f32,
     min_confidence: f32,
     frame_rgb: Option<(&[u8], &std::path::Path)>,
+    snapshot_mode: crate::config::SnapshotMode,
     depth: &[crate::depth::DepthEstimate],
     depth_provider: Option<&str>,
     depth_model: Option<&str>,
+    raw_assets: Option<&crate::assets::AssetStore>,
 ) -> Result<Vec<Recorded>> {
-    let owned_indices: Vec<usize> = dets
+    // Detectors regress boxes past the frame edge for objects touching it
+    // (YOLO's cx±w/2 routinely does), and the store rightly refuses geometry
+    // outside the frame -- so clip here, once, before NMS/zones/geometry see
+    // it. A box with nothing left inside the frame is dropped.
+    let (fw, fh) = (meta.width as f32, meta.height as f32);
+    let (owned_indices, owned): (Vec<usize>, Vec<Detection>) = dets
         .iter()
         .enumerate()
         .filter(|(_, d)| d.confidence >= min_confidence)
-        .map(|(i, _)| i)
-        .collect();
-    let owned: Vec<Detection> = owned_indices.iter().map(|&i| dets[i].clone()).collect();
+        .filter_map(|(i, d)| {
+            let [x0, y0, x1, y1] = d.bbox;
+            let bbox = [
+                x0.clamp(0.0, fw),
+                y0.clamp(0.0, fh),
+                x1.clamp(0.0, fw),
+                y1.clamp(0.0, fh),
+            ];
+            let usable =
+                bbox.iter().all(|v| v.is_finite()) && bbox[2] > bbox[0] && bbox[3] > bbox[1];
+            usable.then(|| (i, Detection { bbox, ..d.clone() }))
+        })
+        .unzip();
     let keep = nms(&owned, nms_iou_threshold);
     let survivors: Vec<&Detection> = keep.iter().map(|&i| &owned[i]).collect();
     // Zones come from the DB and only matter for annotated snapshots, so the
     // query stays on the snapshot-providing path.
     let regions: Vec<Region> = match frame_rgb {
-        Some(_) => store.regions_for(&meta.camera_id)?,
+        Some(_) => store.with_store(|s| s.regions_for(&meta.camera_id))?,
         None => Vec::new(),
     };
 
     let mut recorded = Vec::with_capacity(keep.len());
     for (hi, idx) in keep.into_iter().enumerate() {
         let det = &owned[idx];
-        let zone = store.zone_for_point(&meta.camera_id, det.center())?;
+        let zone = store.with_store(|s| s.zone_for_point(&meta.camera_id, det.center()))?;
         let source_index = owned_indices[idx];
         let depth_input = depth
             .iter()
@@ -171,7 +192,8 @@ pub fn ingest_detections_with_depth(
             }),
             depth: depth_input,
         };
-        let (id, is_new, hits, geometry_id) = store.record_sighting_with_geometry(&input)?;
+        let (id, is_new, hits, geometry_id) =
+            store.with_store(|s| s.record_sighting_with_geometry(&input))?;
         // The typed sighting transaction owns both bounded samples and depth;
         // the returned id identifies this input, even when it arrived late.
         let geometry_id = geometry_id.ok_or_else(|| {
@@ -179,17 +201,56 @@ pub fn ingest_detections_with_depth(
                 "sighting did not return input geometry".into(),
             )
         })?;
-        // A failed snapshot must not break ingestion; also only the FIRST
-        // sighting of an observation gets an image -- and that image is
-        // re-rendered per row, so each one highlights THIS row's box.
-        if is_new && let Some((rgb, dir)) = frame_rgb {
-            match annotate::annotate(rgb, meta.width, meta.height, &survivors, &regions, Some(hi)) {
-                Some(img) => match write_snapshot(dir, id, &img) {
-                    Ok(rel) => store.set_sample_snapshot(id, &rel)?,
-                    Err(e) => tracing::warn!(error = %e, obs = id, "snapshot write failed"),
-                },
-                None => {
-                    tracing::warn!(obs = id, "snapshot skipped: rgb buffer shorter than frame")
+        // Raw assets are daemon-owned and never use the annotated snapshot path.
+        // They are written once for a newly opened observation and registered only
+        // after the JPEG has been fully encoded.
+        if let Some(registry) = raw_assets
+            && is_new
+            && let Some((rgb, _)) = frame_rgb
+            && let Some(owner) = store.with_store(|s| s.observation_by_id(id))?
+            && let Err(error) =
+                registry.publish_rgb(&owner, meta.captured_at, rgb, meta.width, meta.height)
+        {
+            tracing::warn!(error = %error, obs = id, "raw asset publication failed");
+        }
+
+        // Snapshot writing controlled by mode: Off = none, First = new obs only,
+        // Events = new obs (runner writes event snapshots), Detections = every sighting.
+        if let Some((rgb, dir)) = frame_rgb {
+            use crate::config::SnapshotMode;
+            let should_write = match snapshot_mode {
+                SnapshotMode::Off => false,
+                SnapshotMode::First => is_new,
+                SnapshotMode::Events => is_new,
+                SnapshotMode::Detections => true,
+            };
+
+            if should_write {
+                match annotate::annotate(
+                    rgb,
+                    meta.width,
+                    meta.height,
+                    &survivors,
+                    &regions,
+                    Some(hi),
+                ) {
+                    Some(img) => {
+                        let filename = match snapshot_mode {
+                            SnapshotMode::Detections => format!("{id}-g{geometry_id}.jpg"),
+                            _ => format!("{id}.jpg"),
+                        };
+                        match write_snapshot(dir, &filename, &img) {
+                            Ok(rel) => {
+                                if snapshot_mode == SnapshotMode::First {
+                                    store.with_store(|s| s.set_sample_snapshot(id, &rel))?;
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, obs = id, "snapshot write failed"),
+                        }
+                    }
+                    None => {
+                        tracing::warn!(obs = id, "snapshot skipped: rgb buffer shorter than frame")
+                    }
                 }
             }
         }
@@ -210,15 +271,15 @@ pub fn ingest_detections_with_depth(
     Ok(recorded)
 }
 
-/// Encode an (already annotated) RGB image -> JPEG at `{dir}/{id}.jpg`,
+/// Encode an (already annotated) RGB image -> JPEG at `{dir}/{filename}`,
 /// return the stored path string.
 fn write_snapshot(
     dir: &std::path::Path,
-    id: i64,
+    filename: &str,
     img: &image::RgbImage,
 ) -> std::io::Result<String> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{id}.jpg"));
+    let path = dir.join(filename);
     let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 75);
     enc.encode(
@@ -235,6 +296,21 @@ fn write_snapshot(
 /// Convenience: shared handle so the webhook server and a camera loop can both
 /// write. See `frigate::State` (rusqlite::Connection is not Sync).
 pub type SharedStore = std::sync::Arc<std::sync::Mutex<Store>>;
+
+/// Borrow only for database work, never frame decoding or raw JPEG publication.
+pub trait StoreAccess {
+    fn with_store<T>(&self, operation: impl FnOnce(&Store) -> T) -> T;
+}
+impl StoreAccess for Store {
+    fn with_store<T>(&self, operation: impl FnOnce(&Store) -> T) -> T {
+        operation(self)
+    }
+}
+impl StoreAccess for SharedStore {
+    fn with_store<T>(&self, operation: impl FnOnce(&Store) -> T) -> T {
+        operation(&self.lock().expect("store mutex poisoned"))
+    }
+}
 
 pub fn now() -> chrono::DateTime<Utc> {
     Utc::now()
@@ -276,9 +352,16 @@ mod tests {
         }];
         let rgb = vec![128u8; 64 * 48 * 3];
 
-        let recorded =
-            ingest_detections(&store, &meta, &dets, 0.45, 0.3, Some((&rgb, dir.as_path())))
-                .unwrap();
+        let recorded = ingest_detections(
+            &store,
+            &meta,
+            &dets,
+            0.45,
+            0.3,
+            Some((&rgb, dir.as_path())),
+            crate::config::SnapshotMode::First,
+        )
+        .unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0],
@@ -317,5 +400,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A box regressed past the frame edge used to reach the store as-is,
+    /// which refuses out-of-frame geometry -- and that error stopped the
+    /// camera on the first object touching the edge.
+    #[test]
+    fn a_box_past_the_frame_edge_is_clipped_not_fatal() {
+        let store = Store::in_memory().unwrap();
+        let meta = FrameMeta {
+            camera_id: "cam".into(),
+            captured_at: now(),
+            width: 64,
+            height: 48,
+            snapshot_path: None,
+        };
+        let dets = [
+            Detection {
+                label: "chair".into(),
+                confidence: 0.9,
+                bbox: [-3.5, 20.0, 70.25, 52.0],
+            },
+            Detection {
+                label: "cup".into(),
+                confidence: 0.9,
+                bbox: [66.0, 10.0, 80.0, 20.0],
+            },
+        ];
+
+        let recorded = ingest_detections(
+            &store,
+            &meta,
+            &dets,
+            0.45,
+            0.3,
+            None,
+            crate::config::SnapshotMode::First,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the box wholly outside the frame is dropped"
+        );
+        assert_eq!(recorded[0].label, "chair");
+        assert_eq!(recorded[0].bbox, [0.0, 20.0, 64.0, 48.0]);
+        let stored = store
+            .geometry_by_id(recorded[0].geometry_id)
+            .unwrap()
+            .expect("geometry persisted");
+        assert_eq!(stored.bbox, [0.0, 20.0, 64.0, 48.0]);
     }
 }

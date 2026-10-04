@@ -63,6 +63,10 @@ struct Args {
     #[arg(long)]
     snapshots_dir: Option<String>,
 
+    /// Snapshot mode: off, first, events, or detections (default: first).
+    #[arg(long)]
+    snapshots: Option<String>,
+
     /// Run a mock camera pass (blank frames through the pipeline) and exit.
     #[arg(long)]
     demo: bool,
@@ -215,7 +219,7 @@ fn main() -> anyhow::Result<()> {
         file_config.as_ref(),
         &cli_overrides(&args),
         &item_ingest::config::EnvOverrides::from_env(),
-    );
+    )?;
     settings
         .validate(file_config.as_ref())
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -345,6 +349,7 @@ fn cli_overrides(args: &Args) -> CliOverrides {
 
         db: args.db.clone(),
         snapshots_dir: args.snapshots_dir.clone(),
+        snapshots: args.snapshots.clone(),
         listen: args.listen.clone(),
         ..Default::default()
     };
@@ -460,7 +465,15 @@ fn demo_pass(store: &Store) -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         };
         let dets = detector.detect(&frame.rgb, frame.meta.width, frame.meta.height)?;
-        let n = item_ingest::ingest_detections(store, &frame.meta, &dets, 0.5, 0.25, None)?;
+        let n = item_ingest::ingest_detections(
+            store,
+            &frame.meta,
+            &dets,
+            0.5,
+            0.25,
+            None,
+            item_ingest::runtime::SnapshotMode::First,
+        )?;
         tracing::info!(recorded = n.len(), "demo frame processed");
     }
     // Prove the zone mapping and dedup round-trip.
@@ -710,6 +723,8 @@ fn camera_task(
             .map_err(|e| anyhow::anyhow!(e))?,
         detect_fps: settings.detect_fps(),
         snapshot_dir: Path::new(&settings.snapshots_dir).to_path_buf(),
+        snapshots: settings.snapshots,
+        raw_assets: None,
         events_path: settings.events_path(),
         max_frames,
         enabled: true,

@@ -15,6 +15,9 @@ use crate::depth::{NoDepthProvider, RelativeDepthProvider};
 use crate::detector::{Detector, NullDetector};
 use crate::source::{FrameSource, MockSource};
 
+// Re-export SnapshotMode so main.rs and other modules can use it without importing config
+pub use crate::config::SnapshotMode;
+
 /// How to reach one camera's frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSpec {
@@ -120,6 +123,9 @@ pub struct CameraTask {
     pub depth: DepthSpec,
     pub detect_fps: f64,
     pub snapshot_dir: PathBuf,
+    pub snapshots: SnapshotMode,
+    /// Daemon-owned raw asset registry; `None` keeps standalone/test paths unchanged.
+    pub raw_assets: Option<crate::assets::AssetStore>,
     /// Where this camera's appeared/disappeared timeline is appended, or `None`
     /// to run without one (docs/resident-ingest.md §6). A file rather than a
     /// handle so the daemon can hand the same path to every camera.
@@ -324,12 +330,14 @@ mod tests {
 
     fn task(source: Option<SourceSpec>) -> CameraTask {
         CameraTask {
-            camera_id: "cam".into(),
+            camera_id: "test".into(),
             source,
             detector: DetectorSpec::Null,
             depth: DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: PathBuf::from("unused"),
+            snapshots: SnapshotMode::First,
+            raw_assets: None,
             events_path: None,
             max_frames: 0,
             enabled: true,

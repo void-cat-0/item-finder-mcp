@@ -16,7 +16,6 @@
 //! `SIGTERM` on Unix. `tokio::signal::unix` does not exist off Unix, hence the
 //! `#[cfg(unix)]` split -- see [`wait_for_signal`].
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,7 +66,20 @@ pub fn run_with_stop(
     seed: Option<&Config>,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    settings.validate(seed).map_err(anyhow::Error::msg)?;
     reject_unsupported_sources(&tasks)?;
+    // Validate and reserve both listeners before database, lock, health or camera
+    // side effects. Disabled listeners are never bound.
+    let bind = |address: &str| -> anyhow::Result<std::net::TcpListener> {
+        let listener = std::net::TcpListener::bind(address).context("binding daemon listener")?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    };
+    let webhook_listener = settings
+        .webhook_enabled
+        .then(|| bind(&settings.listen))
+        .transpose()?;
+    let internal_listener = settings.internal_listen.as_deref().map(bind).transpose()?;
 
     if let Some(dir) = std::path::Path::new(&settings.db).parent()
         && !dir.as_os_str().is_empty()
@@ -136,6 +148,32 @@ pub fn run_with_stop(
     )));
     write_health(&writer, &registry);
 
+    let asset_store = internal_listener
+        .as_ref()
+        .map(|_| {
+            crate::assets::AssetStore::new_with_ttls(
+                &settings.snapshots_dir,
+                settings.internal_max_asset_bytes,
+                settings.internal_token.clone(),
+                Arc::clone(&store),
+                Duration::from_secs(settings.frame_asset_ttl_secs),
+                Duration::from_millis(settings.frame_cache_ttl_ms),
+            )
+        })
+        .transpose()
+        .context("opening raw asset store")?;
+    let mut tasks = tasks;
+    for task in &mut tasks {
+        task.raw_assets = asset_store.clone();
+        if let Some(assets) = &task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            cache
+                .register(&task.camera_id)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+
     let mut supervisor = Supervisor::new(Arc::clone(&stop)).with_health(registry.clone());
     supervisor.start(&store, tasks);
     tracing::info!("camera threads started");
@@ -198,34 +236,69 @@ pub fn run_with_stop(
     };
 
     let app = build_router(&store, &settings);
-    let addr: SocketAddr = settings
-        .listen
-        .parse()
-        .context("bad listen address (--listen / [webhook] listen)")?;
 
     // Bounded growth (§7): WAL checkpoints, the retention sweep and the orphan
     // scan, all off when their interval is 0.
-    let maintenance_thread = spawn_maintenance(Arc::clone(&store), &settings, Arc::clone(&stop))
-        .context("spawning the maintenance thread")?;
+    let maintenance_thread = spawn_maintenance(
+        Arc::clone(&store),
+        &settings,
+        Arc::clone(&stop),
+        asset_store.clone(),
+    )
+    .context("spawning the maintenance thread")?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
-        if settings.webhook_enabled {
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+    let serve_result = runtime.block_on(async {
+        let signal_stop = stop.clone();
+        let signal_task = tokio::spawn(async move {
+            wait_for_stop(signal_stop.clone()).await;
+            signal_stop.store(true, Ordering::SeqCst);
+        });
+        let mut servers = tokio::task::JoinSet::new();
+        if let Some(listener) = webhook_listener {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let addr = listener.local_addr()?;
             tracing::info!(%addr, "frigate webhook server listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(wait_for_stop(Arc::clone(&stop)))
-                .await?;
-        } else {
-            tracing::info!(
-                "webhook disabled ([webhook] enabled = false); waiting for a stop signal"
-            );
-            wait_for_stop(Arc::clone(&stop)).await;
+            let stop = stop.clone();
+            servers.spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(wait_for_flag(stop))
+                    .await
+            });
         }
-        anyhow::Ok(())
-    })?;
+        if let (Some(listener), Some(assets)) = (internal_listener, asset_store) {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let addr = listener.local_addr()?;
+            let app = crate::assets::router(assets, addr);
+            tracing::info!(%addr, "private raw asset server listening");
+            let stop = stop.clone();
+            servers.spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(wait_for_flag(stop))
+                    .await
+            });
+        }
+        let mut failure = None;
+        if servers.is_empty() {
+            wait_for_flag(stop.clone()).await;
+        }
+        while let Some(result) = servers.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failure = Some(anyhow::Error::from(e));
+                }
+                Err(e) => {
+                    failure = Some(anyhow::Error::from(e));
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        }
+        signal_task.abort();
+        failure.map_or(Ok(()), Err)
+    });
 
     // From here on: nobody new is connecting, so drain the cameras.
     stop.store(true, Ordering::SeqCst);
@@ -264,7 +337,7 @@ pub fn run_with_stop(
 
     drop(lock);
     tracing::info!("ingest daemon stopped");
-    Ok(())
+    serve_result
 }
 
 /// One periodic job. A zero interval means the job is off -- which is why the
@@ -337,6 +410,7 @@ fn spawn_maintenance(
     store: SharedStore,
     settings: &RuntimeConfig,
     stop: Arc<AtomicBool>,
+    asset_store: Option<crate::assets::AssetStore>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let window = settings.retention_window();
     let snapshots_dir = PathBuf::from(&settings.snapshots_dir);
@@ -346,6 +420,7 @@ fn spawn_maintenance(
         None => Cadence::off(),
     };
     let mut reconcile = Cadence::new(Duration::from_secs(settings.reconcile_secs));
+    let mut frames = Cadence::new(Duration::from_secs(1));
     tracing::info!(
         checkpoint_secs = settings.checkpoint_secs,
         sweep_secs = settings.sweep_secs,
@@ -362,6 +437,12 @@ fn spawn_maintenance(
                 std::thread::sleep(TICK);
                 if stop.load(Ordering::SeqCst) {
                     return;
+                }
+                if frames.tick(TICK)
+                    && let Some(assets) = &asset_store
+                    && let Err(error) = assets.purge_expired_camera_assets()
+                {
+                    tracing::warn!(%error, "camera asset cleanup deferred");
                 }
                 if checkpoint.tick(TICK) {
                     checkpoint_wal(&store);
@@ -581,6 +662,12 @@ async fn wait_for_signal() {
 
 /// Either a process signal or someone flipping the flag (tests, and the
 /// `--daemon` path when the flag is set by another task).
+async fn wait_for_flag(stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_stop(stop: Arc<AtomicBool>) {
     tokio::select! {
         _ = wait_for_signal() => {}
@@ -610,6 +697,8 @@ mod tests {
             depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
+            snapshots: crate::config::SnapshotMode::First,
+            raw_assets: None,
             events_path: None,
             max_frames: 0,
             enabled: true,
@@ -637,7 +726,8 @@ mod tests {
         /// off so the test needs no port.
         fn settings(&self) -> RuntimeConfig {
             let mut settings =
-                RuntimeConfig::resolve(None, &CliOverrides::default(), &EnvOverrides::default());
+                RuntimeConfig::resolve(None, &CliOverrides::default(), &EnvOverrides::default())
+                    .unwrap();
             settings.db = self.path("items.db").display().to_string();
             settings.snapshots_dir = self.path("snapshots").display().to_string();
             settings.health_file = self.path("health.json").display().to_string();
@@ -681,6 +771,200 @@ mod tests {
         Store::open_read_only(db)
             .and_then(|store| store.count_observations())
             .unwrap_or(-1)
+    }
+
+    fn unused_address() -> String {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn private_listener_validation_precedes_all_side_effects() {
+        let sandbox = Sandbox::new("invalid-private");
+        let mut settings = sandbox.settings();
+        settings.internal_listen = Some("0.0.0.0:8480".into());
+        settings.internal_token = Some("do-not-log".into());
+        let result = run_with_stop(
+            settings.clone(),
+            vec![],
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(result.unwrap_err().to_string().contains("loopback"));
+        assert!(!sandbox.path("items.db").exists());
+        assert!(!sandbox.path("health.json").exists());
+        assert!(!sandbox.path("ingest.lock").exists());
+        settings.internal_listen = Some(unused_address());
+        settings.internal_token = None;
+        assert!(
+            run_with_stop(
+                settings.clone(),
+                vec![],
+                None,
+                Arc::new(AtomicBool::new(false))
+            )
+            .is_err()
+        );
+        assert!(!sandbox.path("items.db").exists());
+        assert!(!format!("{settings:?}").contains("do-not-log"));
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        settings.internal_listen = Some(held.local_addr().unwrap().to_string());
+        settings.internal_token = Some("token".into());
+        assert!(run_with_stop(settings, vec![], None, Arc::new(AtomicBool::new(false))).is_err());
+        assert!(!sandbox.path("items.db").exists());
+    }
+
+    #[test]
+    fn private_http_is_separate_concurrent_restartable_and_stops_with_webhook() {
+        let sandbox = Sandbox::new("real-http");
+        let db = Arc::new(Mutex::new(Store::open(sandbox.path("items.db")).unwrap()));
+        let now = Utc::now();
+        let owner = {
+            let guard = db.lock().unwrap();
+            let (id, _, _) = guard
+                .record_sighting(
+                    "cam",
+                    "frame",
+                    "cup",
+                    now,
+                    None,
+                    item_core::store::DEFAULT_DEDUP_WINDOW,
+                )
+                .unwrap();
+            guard.observation_by_id(id).unwrap().unwrap()
+        };
+        let raw = crate::assets::AssetStore::new(
+            sandbox.path("snapshots"),
+            crate::assets::DEFAULT_MAX_ASSET_BYTES,
+            Some("http-secret".into()),
+            db.clone(),
+        )
+        .unwrap();
+        let metadata = raw.publish_rgb(&owner, now, &[45; 18], 3, 2).unwrap();
+        // Only the durable manifest survives; the daemon receives no registry.
+        drop(raw);
+        let mut settings = sandbox.settings();
+        settings.retention_days = 0;
+        settings.webhook_enabled = true;
+        settings.listen = unused_address();
+        settings.internal_listen = Some(unused_address());
+        settings.internal_token = Some("http-secret".into());
+        let private = format!("http://{}", settings.internal_listen.as_ref().unwrap());
+        let webhook = format!("http://{}", settings.listen);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let (settings, stop) = (settings.clone(), stop.clone());
+                std::thread::spawn(move || run_with_stop(settings, vec![], None, stop))
+            };
+            assert!(wait_until(Duration::from_secs(10), || client
+                .get(format!(
+                    "{private}/internal/v1/assets/{}",
+                    metadata.asset_id
+                ))
+                .bearer_auth("http-secret")
+                .send()
+                .is_ok_and(|r| r.status().is_success())));
+            let response = client
+                .get(format!(
+                    "{private}/internal/v1/observations/{}/raw-asset",
+                    owner.id
+                ))
+                .bearer_auth("http-secret")
+                .send()
+                .unwrap();
+            assert_eq!(
+                response
+                    .json::<item_core::assets::RawAssetMetadata>()
+                    .unwrap(),
+                metadata
+            );
+            let response = client
+                .get(format!(
+                    "{private}/internal/v1/assets/{}/content",
+                    metadata.asset_id
+                ))
+                .bearer_auth("http-secret")
+                .send()
+                .unwrap();
+            assert_eq!(response.headers()["content-type"], "image/jpeg");
+            assert_eq!(response.headers()["x-asset-id"], metadata.asset_id);
+            assert_eq!(response.headers()["x-asset-sha256"], metadata.sha256);
+            assert_eq!(
+                crate::assets::hex_digest(&response.bytes().unwrap()),
+                metadata.sha256
+            );
+            assert_eq!(
+                client
+                    .get(format!(
+                        "{webhook}/internal/v1/assets/{}",
+                        metadata.asset_id
+                    ))
+                    .bearer_auth("http-secret")
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::NOT_FOUND
+            );
+            // A live webhook and private listener share no routes or auth state.
+            assert!(client.get(format!("{webhook}/")).send().is_ok());
+            assert_eq!(
+                client
+                    .get(format!(
+                        "{private}/internal/v1/assets/{}",
+                        metadata.asset_id
+                    ))
+                    .send()
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+            for (header, value) in [
+                ("host", "attacker.example"),
+                ("origin", "http://attacker.example"),
+            ] {
+                assert_eq!(
+                    client
+                        .get(format!(
+                            "{private}/internal/v1/assets/{}",
+                            metadata.asset_id
+                        ))
+                        .header(header, value)
+                        .bearer_auth("http-secret")
+                        .send()
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::FORBIDDEN
+                );
+            }
+            let unavailable = client
+                .get(format!("{private}/internal/v1/observations/999/raw-asset"))
+                .bearer_auth("http-secret")
+                .send()
+                .unwrap();
+            assert_eq!(unavailable.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                unavailable
+                    .json::<item_core::assets::AssetErrorBody>()
+                    .unwrap()
+                    .error
+                    .code,
+                "not_found"
+            );
+            stop.store(true, Ordering::SeqCst);
+            worker.join().unwrap().unwrap();
+            assert!(client.get(format!("{private}/")).send().is_err());
+            assert!(client.get(format!("{webhook}/")).send().is_err());
+            assert!(!sandbox.path("ingest.lock").exists());
+        }
     }
 
     #[test]

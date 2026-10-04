@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/item-ingest", "crates/item-query", "crates/xtask", "crates/item-web"]
+members = ["crates/core", "crates/item-ingest", "crates/item-query", "crates/xtask", "crates/item-web", "crates/item-mcp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +23,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 image = "0.25"
 base64 = "0.22"
+sha2 = "0.10"
+rmcp = { version = "~3.5", default-features = false, features = ["server", "macros", "transport-io"] }

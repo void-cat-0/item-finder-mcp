@@ -112,6 +112,7 @@ pub struct CameraRunner {
     tracker: Tracker,
     log: Option<EventLog>,
     session_id: String,
+    cache_generation: u64,
 }
 
 impl CameraRunner {
@@ -169,6 +170,7 @@ impl CameraRunner {
                 std::process::id(),
                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
             ),
+            cache_generation: 0,
         })
     }
 
@@ -193,11 +195,22 @@ impl CameraRunner {
     /// Build the frame source. Call this on the thread that will own it.
     pub fn open(&mut self) -> Result<()> {
         self.state = CameraState::Starting;
+        if let Some(assets) = &self.task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            let _ = cache.register(&self.task.camera_id);
+            self.cache_generation = cache.set_state(&self.task.camera_id, "starting");
+        }
         match crate::runtime::build_source(&self.task) {
             Ok(src) => {
                 self.source = Some(src);
                 self.opens += 1;
                 self.state = CameraState::Running;
+                if let Some(assets) = &self.task.raw_assets
+                    && let Some(cache) = assets.frame_cache()
+                {
+                    self.cache_generation = cache.set_state(&self.task.camera_id, "running");
+                }
                 self.last_error = None;
                 Ok(())
             }
@@ -212,12 +225,17 @@ impl CameraRunner {
     /// Drop the source so the next `open()` rebuilds it.
     pub fn close(&mut self) {
         self.source = None;
+        if let Some(assets) = &self.task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            self.cache_generation = cache.set_state(&self.task.camera_id, "reconnecting");
+        }
     }
 
     /// One short step: pull a frame, throttle, detect, persist.
-    pub fn step(&mut self, store: &Store) -> Result<StepOutcome> {
+    pub fn step(&mut self, store: &impl crate::StoreAccess) -> Result<StepOutcome> {
         if self.task.max_frames > 0 && self.frames >= self.task.max_frames {
-            self.state = CameraState::Stopped;
+            self.mark_stopped();
             return Ok(StepOutcome::Finished);
         }
 
@@ -226,18 +244,40 @@ impl CameraRunner {
             return Ok(StepOutcome::Lost(None));
         };
 
-        let frame = match source.next_frame() {
+        // Capture this immediately after the source returns, before any frame
+        // clone, JPEG work, detector throttling, or inference can add age.
+        let received = source.next_frame();
+        let acquired_at = Instant::now();
+        let frame = match received {
             Ok(f) => f,
             Err(e) => {
                 self.last_error = Some(e.to_string());
                 self.state = CameraState::Reconnecting;
                 self.source = None;
+                if let Some(assets) = &self.task.raw_assets
+                    && let Some(cache) = assets.frame_cache()
+                {
+                    self.cache_generation = cache.set_state(&self.task.camera_id, "reconnecting");
+                }
                 return Ok(StepOutcome::Lost(Some(e)));
             }
         };
 
         self.frames += 1;
-        self.last_frame_at = Some(Instant::now());
+        self.last_frame_at = Some(acquired_at);
+        if let Some(assets) = &self.task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            let _ = cache.publish(
+                &self.task.camera_id,
+                self.cache_generation,
+                frame.rgb.clone(),
+                frame.meta.width,
+                frame.meta.height,
+                frame.meta.captured_at,
+                acquired_at,
+            );
+        }
 
         let due = match self.last_detect {
             None => true,
@@ -284,9 +324,11 @@ impl CameraRunner {
             0.45,
             0.0, // the detector already floors at conf
             Some((&frame.rgb, self.task.snapshot_dir.as_path())),
+            self.task.snapshots,
             &depth,
             (!depth.is_empty()).then_some(self.depth.provider_name()),
             self.depth.model_ref(),
+            self.task.raw_assets.as_ref(),
         )?;
         self.recorded += recorded.len() as u64;
         if !recorded.is_empty() {
@@ -296,12 +338,14 @@ impl CameraRunner {
                 "detections ingested"
             );
         }
-        self.emit_events(
-            store,
-            &frame.meta.camera_id,
-            &recorded,
-            frame.meta.captured_at,
-        );
+        store.with_store(|store| {
+            self.emit_events(
+                store,
+                &frame.meta.camera_id,
+                &recorded,
+                frame.meta.captured_at,
+            )
+        });
         Ok(StepOutcome::Detected {
             recorded: recorded.len(),
         })
@@ -417,10 +461,20 @@ impl CameraRunner {
     pub fn mark_failed(&mut self, reason: impl Into<String>) {
         self.last_error = Some(reason.into());
         self.state = CameraState::Failed;
+        if let Some(assets) = &self.task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            self.cache_generation = cache.set_state(&self.task.camera_id, "failed");
+        }
     }
 
     pub fn mark_stopped(&mut self) {
         self.state = CameraState::Stopped;
+        if let Some(assets) = &self.task.raw_assets
+            && let Some(cache) = assets.frame_cache()
+        {
+            self.cache_generation = cache.set_state(&self.task.camera_id, "stopped");
+        }
     }
 
     /// Exponentially-weighted mean of inference time, for the health file.
@@ -495,6 +549,8 @@ mod tests {
             depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: dir.to_path_buf(),
+            snapshots: crate::config::SnapshotMode::First,
+            raw_assets: None,
             events_path: Some(dir.join("events.jsonl")),
             max_frames: 0,
             enabled: true,
@@ -519,11 +575,68 @@ mod tests {
             depth: crate::runtime::DepthSpec::None,
             detect_fps: 1.0,
             snapshot_dir: std::path::PathBuf::from("unused"),
+            snapshots: crate::config::SnapshotMode::First,
+            raw_assets: None,
             events_path: None,
             max_frames,
             enabled: true,
         };
         CameraRunner::new(task, Box::new(NullDetector))
+    }
+
+    #[tokio::test]
+    async fn latest_cache_updates_without_detections_and_drops_on_source_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(Store::in_memory().unwrap()));
+        let assets = crate::assets::AssetStore::new(
+            dir.path(),
+            8 * 1024 * 1024,
+            Some("test-secret".into()),
+            db.clone(),
+        )
+        .unwrap();
+        let cache = assets.frame_cache().unwrap();
+        let mut r = runner(3, 0);
+        r.task.raw_assets = Some(assets);
+        r.open().unwrap();
+        assert!(matches!(
+            r.step(&db).unwrap(),
+            StepOutcome::Detected { recorded: 0 }
+        ));
+        let first = cache
+            .wait_fresh("cam", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(r.step(&db).unwrap(), StepOutcome::Throttled));
+        let second = cache
+            .wait_fresh("cam", Duration::from_secs(1), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert!(db.lock().unwrap().recent(None, 1).unwrap().is_empty());
+        r.step(&db).unwrap();
+        assert!(matches!(r.step(&db).unwrap(), StepOutcome::Lost(_)));
+        assert!(matches!(
+            cache
+                .wait_fresh("cam", Duration::from_secs(60), Duration::ZERO)
+                .await,
+            Err(crate::frame_cache::FrameLookupError::CameraOffline)
+        ));
+        r.open().unwrap();
+        assert!(matches!(
+            cache
+                .wait_fresh("cam", Duration::from_secs(1), Duration::ZERO)
+                .await,
+            Err(crate::frame_cache::FrameLookupError::FrameUnavailable)
+        ));
+        r.step(&db).unwrap();
+        r.mark_stopped();
+        assert!(matches!(
+            cache
+                .wait_fresh("cam", Duration::from_secs(1), Duration::ZERO)
+                .await,
+            Err(crate::frame_cache::FrameLookupError::CameraOffline)
+        ));
     }
 
     #[test]
