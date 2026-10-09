@@ -1,5 +1,5 @@
 //! The resident daemon: one process running the Frigate webhook server, the
-//! optional RTSP preview and N camera threads (docs/resident-ingest.md §3).
+//! optional RTSP preview and N camera threads (design/resident-ingest.md §3).
 //!
 //! Shutdown follows §3 exactly, because the order is the whole point:
 //!
@@ -116,6 +116,15 @@ pub fn run_with_stop(
     let store: SharedStore = Arc::new(Mutex::new(
         Store::open(&settings.db).context("opening sqlite store")?,
     ));
+    // Annotation tables are opt-in data owned by the daemon, but their
+    // migration/reconciliation must happen before any listener accepts writes,
+    // including when annotation writes are disabled.
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        guard
+            .ensure_annotation_schema()
+            .context("initializing annotation schema")?;
+    }
 
     if let Some(file) = seed {
         let guard = store.lock().expect("store mutex poisoned");
@@ -148,20 +157,61 @@ pub fn run_with_stop(
     )));
     write_health(&writer, &registry);
 
-    let asset_store = internal_listener
-        .as_ref()
-        .map(|_| {
-            crate::assets::AssetStore::new_with_ttls(
-                &settings.snapshots_dir,
-                settings.internal_max_asset_bytes,
-                settings.internal_token.clone(),
-                Arc::clone(&store),
-                Duration::from_secs(settings.frame_asset_ttl_secs),
-                Duration::from_millis(settings.frame_cache_ttl_ms),
-            )
-        })
-        .transpose()
-        .context("opening raw asset store")?;
+    let asset_store = Some(
+        crate::assets::AssetStore::new_with_ttls(
+            &settings.snapshots_dir,
+            settings.internal_max_asset_bytes,
+            settings.internal_token.clone(),
+            Arc::clone(&store),
+            Duration::from_secs(settings.frame_asset_ttl_secs),
+            Duration::from_millis(settings.frame_cache_ttl_ms),
+        )
+        .context("opening raw asset store")?
+        .with_camera_status(
+            if let Some(config) = seed {
+                config
+                    .camera
+                    .iter()
+                    .map(|camera| crate::assets::CameraRegistration {
+                        camera_id: camera.id.clone(),
+                        enabled: camera.enabled.unwrap_or(true),
+                        source_kind: camera
+                            .url
+                            .as_deref()
+                            .filter(|url| !url.is_empty())
+                            .map(|_| "rtsp")
+                            .or_else(|| camera.webcam.map(|_| "webcam"))
+                            .unwrap_or("webhook")
+                            .into(),
+                    })
+                    .collect()
+            } else {
+                tasks
+                    .iter()
+                    .map(|task| crate::assets::CameraRegistration {
+                        camera_id: task.camera_id.clone(),
+                        enabled: task.enabled,
+                        source_kind: task
+                            .source
+                            .as_ref()
+                            .map(|s| s.kind())
+                            .unwrap_or("webhook")
+                            .into(),
+                    })
+                    .collect()
+            },
+            registry.clone(),
+            stop.clone(),
+        ),
+    );
+    let annotations = crate::annotations::AnnotationRuntime::new(
+        asset_store
+            .as_ref()
+            .expect("asset store initialized")
+            .clone(),
+        &settings,
+    )
+    .context("opening annotation runtime")?;
     let mut tasks = tasks;
     for task in &mut tasks {
         task.raw_assets = asset_store.clone();
@@ -244,6 +294,7 @@ pub fn run_with_stop(
         &settings,
         Arc::clone(&stop),
         asset_store.clone(),
+        Some(annotations.clone()),
     )
     .context("spawning the maintenance thread")?;
 
@@ -271,7 +322,8 @@ pub fn run_with_stop(
         if let (Some(listener), Some(assets)) = (internal_listener, asset_store) {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             let addr = listener.local_addr()?;
-            let app = crate::assets::router(assets, addr);
+            let app = crate::assets::router(assets, addr)
+                .merge(crate::annotations::router(annotations.clone(), addr));
             tracing::info!(%addr, "private raw asset server listening");
             let stop = stop.clone();
             servers.spawn(async move {
@@ -411,6 +463,7 @@ fn spawn_maintenance(
     settings: &RuntimeConfig,
     stop: Arc<AtomicBool>,
     asset_store: Option<crate::assets::AssetStore>,
+    annotations: Option<crate::annotations::AnnotationRuntime>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let window = settings.retention_window();
     let snapshots_dir = PathBuf::from(&settings.snapshots_dir);
@@ -421,6 +474,7 @@ fn spawn_maintenance(
     };
     let mut reconcile = Cadence::new(Duration::from_secs(settings.reconcile_secs));
     let mut frames = Cadence::new(Duration::from_secs(1));
+    let mut annotations_cadence = Cadence::due_now(Duration::from_secs(60));
     tracing::info!(
         checkpoint_secs = settings.checkpoint_secs,
         sweep_secs = settings.sweep_secs,
@@ -437,6 +491,12 @@ fn spawn_maintenance(
                 std::thread::sleep(TICK);
                 if stop.load(Ordering::SeqCst) {
                     return;
+                }
+                if let Some(runtime) = &annotations
+                    && annotations_cadence.tick(TICK)
+                    && let Err(error) = runtime.maintenance()
+                {
+                    tracing::warn!(error = ?error, "annotation cleanup deferred");
                 }
                 if frames.tick(TICK)
                     && let Some(assets) = &asset_store

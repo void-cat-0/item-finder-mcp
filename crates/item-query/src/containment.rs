@@ -64,10 +64,105 @@ pub fn find_candidates(
     window: Duration,
     priors: &Priors,
 ) -> Vec<Candidate> {
+    evaluate(events, target_label, window, priors, false)
+        .candidates
+        .into_iter()
+        .map(|c| c.candidate)
+        .collect()
+}
+
+/// The trace is produced at the actual selection sites, never reconstructed from output IDs.
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectionTrace {
+    pub cover_geometry_event_id: i64,
+    pub persistence_event_ids: Vec<i64>,
+    pub target_depth_id: Option<i64>,
+    pub cover_depth_id: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct AuditedCandidate {
+    pub candidate: Candidate,
+    pub trace: SelectionTrace,
+}
+#[derive(Debug, Default)]
+pub struct Evaluation {
+    pub candidates: Vec<AuditedCandidate>,
+    pub diagnostics: std::collections::BTreeMap<&'static str, usize>,
+}
+
+pub fn evaluate(
+    events: &[SceneEvent],
+    target_label: &str,
+    window: Duration,
+    priors: &Priors,
+    strict_depth: bool,
+) -> Evaluation {
+    evaluate_with_check(
+        events,
+        target_label,
+        window,
+        priors,
+        strict_depth,
+        || Ok(()),
+    )
+    .expect("infallible rule evaluation")
+}
+
+pub fn evaluate_with_check(
+    events: &[SceneEvent],
+    target_label: &str,
+    window: Duration,
+    priors: &Priors,
+    strict_depth: bool,
+    check: impl Fn() -> item_core::store::Result<()>,
+) -> item_core::store::Result<Evaluation> {
+    evaluate_selected(
+        events,
+        target_label,
+        None,
+        window,
+        priors,
+        strict_depth,
+        check,
+    )
+}
+
+pub fn evaluate_anchor_with_check(
+    events: &[SceneEvent],
+    target_label: &str,
+    anchor_id: i64,
+    window: Duration,
+    priors: &Priors,
+    check: impl Fn() -> item_core::store::Result<()>,
+) -> item_core::store::Result<Evaluation> {
+    evaluate_selected(
+        events,
+        target_label,
+        Some(anchor_id),
+        window,
+        priors,
+        true,
+        check,
+    )
+}
+
+fn evaluate_selected(
+    events: &[SceneEvent],
+    target_label: &str,
+    anchor_id: Option<i64>,
+    window: Duration,
+    priors: &Priors,
+    strict_depth: bool,
+    check: impl Fn() -> item_core::store::Result<()>,
+) -> item_core::store::Result<Evaluation> {
     let window = window.max(Duration::zero());
     let mut out = Vec::new();
+    let mut diagnostics = std::collections::BTreeMap::new();
 
-    for target in events.iter().filter(|event| is_target(event, target_label)) {
+    for target in events.iter().filter(|event| {
+        is_target(event, target_label) && anchor_id.is_none_or(|id| event.event.id == id)
+    }) {
+        check()?;
         let Some(target_geo) = valid_geometry(target.geometry.as_ref()) else {
             continue;
         };
@@ -82,8 +177,9 @@ pub fn find_candidates(
             is_cover_appearance(event, target, session_id)
                 && within_last_hit_window(event.event.occurred_at, target.event.occurred_at, window)
         }) {
+            check()?;
             let Some((cover, persistence)) =
-                cover_lifecycle(events, cover_appearance, target, window)
+                cover_lifecycle(events, cover_appearance, target, window, strict_depth)
             else {
                 continue;
             };
@@ -97,10 +193,12 @@ pub fn find_candidates(
                 continue;
             }
 
-            let depth = depth_compatibility(target, cover, target_geo, cover_geo);
+            let depth = depth_compatibility(target, cover, target_geo, cover_geo, strict_depth);
             if depth.state == "conflicting" {
+                *diagnostics.entry("depth_conflict").or_insert(0) += 1;
                 continue;
             }
+            let selected_depth_ids = (depth.target_depth_id, depth.cover_depth_id);
 
             let same_label_ambiguous = target.event.label.eq_ignore_ascii_case(&cover.event.label);
             let person = is_person_label(&cover.event.label);
@@ -267,38 +365,64 @@ pub fn find_candidates(
                 )
             };
 
-            out.push(Candidate {
-                target_event_id: target.event.id,
-                cover_event_id: cover_appearance.event.id,
-                target_observation_id: target.event.observation_id,
-                cover_observation_id: cover.event.observation_id,
-                target_geometry_id: target.geometry.as_ref().map(|geometry| geometry.id),
-                cover_geometry_id: cover.geometry.as_ref().map(|geometry| geometry.id),
-                target_label: target.event.label.clone(),
-                cover_label: cover.event.label.clone(),
-                target_last_hit: target.event.occurred_at,
-                cover_appeared_at: cover_appearance.event.occurred_at,
-                camera_id: target.event.camera_id.clone(),
-                zone: target_geo.zone.clone(),
-                relation,
-                score,
-                same_label_ambiguous,
-                rule_version: RULE_VERSION,
-                priors_ref: priors.reference().to_owned(),
-                explanation,
-                evidence,
+            let trace = SelectionTrace {
+                cover_geometry_event_id: cover.event.id,
+                persistence_event_ids: persistence.event_ids.clone(),
+                target_depth_id: selected_depth_ids.0,
+                cover_depth_id: selected_depth_ids.1,
+            };
+            out.push(AuditedCandidate {
+                trace,
+                candidate: Candidate {
+                    target_event_id: target.event.id,
+                    cover_event_id: cover_appearance.event.id,
+                    target_observation_id: target.event.observation_id,
+                    cover_observation_id: cover.event.observation_id,
+                    target_geometry_id: target.geometry.as_ref().map(|geometry| geometry.id),
+                    cover_geometry_id: cover.geometry.as_ref().map(|geometry| geometry.id),
+                    target_label: target.event.label.clone(),
+                    cover_label: cover.event.label.clone(),
+                    target_last_hit: target.event.occurred_at,
+                    cover_appeared_at: cover_appearance.event.occurred_at,
+                    camera_id: target.event.camera_id.clone(),
+                    zone: target_geo.zone.clone(),
+                    relation,
+                    score,
+                    same_label_ambiguous,
+                    rule_version: RULE_VERSION,
+                    priors_ref: priors.reference().to_owned(),
+                    explanation,
+                    evidence,
+                },
             });
         }
     }
 
     out.sort_by(|left, right| {
         right
+            .candidate
             .score
-            .total_cmp(&left.score)
-            .then_with(|| left.target_event_id.cmp(&right.target_event_id))
-            .then_with(|| left.cover_event_id.cmp(&right.cover_event_id))
+            .total_cmp(&left.candidate.score)
+            .then_with(|| {
+                left.candidate
+                    .target_event_id
+                    .cmp(&right.candidate.target_event_id)
+            })
+            .then_with(|| {
+                left.candidate
+                    .cover_event_id
+                    .cmp(&right.candidate.cover_event_id)
+            })
+            .then_with(|| {
+                left.candidate
+                    .cover_geometry_id
+                    .cmp(&right.candidate.cover_geometry_id)
+            })
     });
-    out
+    Ok(Evaluation {
+        candidates: out,
+        diagnostics,
+    })
 }
 
 fn is_target(event: &SceneEvent, target_label: &str) -> bool {
@@ -352,6 +476,7 @@ fn cover_lifecycle<'a>(
     appearance: &'a SceneEvent,
     target: &SceneEvent,
     window: Duration,
+    strict: bool,
 ) -> Option<(&'a SceneEvent, Persistence)> {
     let mut related: Vec<&SceneEvent> = events
         .iter()
@@ -361,10 +486,13 @@ fn cover_lifecycle<'a>(
                 && event.event.zone == appearance.event.zone
                 && event.event.session_id == appearance.event.session_id
                 && !excluded_event(event)
+                && (!strict
+                    || (event.event.occurred_at, event.event.id)
+                        >= (appearance.event.occurred_at, appearance.event.id))
                 && valid_geometry(event.geometry.as_ref()).is_some()
         })
         .collect();
-    related.sort_by_key(|event| event.event.occurred_at);
+    related.sort_by_key(|event| (event.event.occurred_at, event.event.id));
 
     let last = related.last().copied()?;
     let duration = last
@@ -398,6 +526,26 @@ fn cover_lifecycle<'a>(
         return None;
     }
 
+    // Only the actual extrema/declared witnesses influence persistence and score.
+    let max_duration = related
+        .iter()
+        .filter(|e| e.event.seen_for_s.is_some())
+        .max_by(|a, b| {
+            a.event
+                .seen_for_s
+                .unwrap_or_default()
+                .total_cmp(&b.event.seen_for_s.unwrap_or_default())
+        });
+    let max_hits = related.iter().max_by_key(|e| e.event.hits);
+    let mut witness_ids = vec![appearance.event.id, last.event.id];
+    if let Some(e) = max_duration {
+        witness_ids.push(e.event.id);
+    }
+    if let Some(e) = max_hits {
+        witness_ids.push(e.event.id);
+    }
+    witness_ids.sort_unstable();
+    witness_ids.dedup();
     let persistence = Persistence {
         seconds: related
             .iter()
@@ -409,6 +557,7 @@ fn cover_lifecycle<'a>(
             .map(|event| event.event.hits)
             .max()
             .unwrap_or(0),
+        event_ids: witness_ids,
     };
 
     // Prefer geometry at or just before the target, otherwise the appearance
@@ -425,10 +574,11 @@ fn cover_lifecycle<'a>(
         .map(|geometry| (geometry, persistence))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Persistence {
     seconds: f32,
     hits: i64,
+    event_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -480,6 +630,8 @@ fn geometry_overlap(a: &ObservationGeometry, b: &ObservationGeometry) -> Option<
 struct DepthCompatibility {
     state: &'static str,
     detail: String,
+    target_depth_id: Option<i64>,
+    cover_depth_id: Option<i64>,
 }
 
 fn depth_compatibility(
@@ -487,10 +639,13 @@ fn depth_compatibility(
     cover: &SceneEvent,
     target_geo: &ObservationGeometry,
     cover_geo: &ObservationGeometry,
+    strict: bool,
 ) -> DepthCompatibility {
     if target_geo.captured_at != cover_geo.captured_at {
         return DepthCompatibility {
             state: "unknown",
+            target_depth_id: None,
+            cover_depth_id: None,
             detail: "depth not compared: target and cover geometry came from different frames"
                 .into(),
         };
@@ -500,13 +655,37 @@ fn depth_compatibility(
     else {
         return DepthCompatibility {
             state: "unknown",
+            target_depth_id: None,
+            cover_depth_id: None,
             detail: "no comparable same-frame relative depth evidence".into(),
         };
     };
     if target_depth.response_id.is_empty() || target_depth.response_id != cover_depth.response_id {
         return DepthCompatibility {
             state: "unknown",
+            target_depth_id: Some(target_depth.id),
+            cover_depth_id: Some(cover_depth.id),
             detail: "depth not compared: samples came from different provider responses".into(),
+        };
+    }
+    if strict
+        && (target_depth.mode != "relative"
+            || cover_depth.mode != "relative"
+            || !safe_provenance(&target_depth.frame_id)
+            || target_depth.frame_id != cover_depth.frame_id
+            || !safe_provenance(&target_depth.provider)
+            || target_depth.provider != cover_depth.provider
+            || !safe_provenance(&target_depth.response_id)
+            || !safe_provenance(&target_depth.prompt_version)
+            || !safe_provenance(&cover_depth.prompt_version)
+            || !safe_provenance(&target_depth.backend_version)
+            || !safe_provenance(&cover_depth.backend_version))
+    {
+        return DepthCompatibility {
+            state: "unknown",
+            detail: "depth provenance is missing or incompatible".into(),
+            target_depth_id: Some(target_depth.id),
+            cover_depth_id: Some(cover_depth.id),
         };
     }
     let target_farther = target_depth.relation_to_camera == "farther";
@@ -516,19 +695,38 @@ fn depth_compatibility(
     if target_nearer && cover_farther {
         DepthCompatibility {
             state: "conflicting",
+            target_depth_id: Some(target_depth.id),
+            cover_depth_id: Some(cover_depth.id),
             detail: "same-frame depth places the target in front of the cover".into(),
         }
     } else if target_farther && cover_nearer {
         DepthCompatibility {
             state: "supporting",
+            target_depth_id: Some(target_depth.id),
+            cover_depth_id: Some(cover_depth.id),
             detail: "same-frame depth places the cover in front of the target".into(),
         }
     } else {
         DepthCompatibility {
             state: "unknown",
+            target_depth_id: Some(target_depth.id),
+            cover_depth_id: Some(cover_depth.id),
             detail: "same-frame depth has no decisive ordering".into(),
         }
     }
+}
+
+/// Logical provenance only: references resembling paths, URLs or credentials are unusable.
+pub fn safe_provenance(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|c| c.is_alphanumeric() || "._-+".contains(c))
+        && !["token", "password", "secret", "bearer", "api_key", "apikey"]
+            .iter()
+            .any(|s| lower.contains(s))
 }
 
 fn usable_depth(depth: &[DepthEvidence]) -> Option<&DepthEvidence> {

@@ -233,6 +233,17 @@ impl FrameCache {
             .map(|s| s.state.clone())
     }
 
+    pub fn status(&self, camera_id: &str) -> Option<(String, Option<u64>, bool)> {
+        let inner = self.inner.lock().ok()?;
+        let slot = inner.cameras.get(camera_id)?;
+        let age = slot.frame.as_ref().map(|f| f.acquired_at.elapsed());
+        Some((
+            slot.state.clone(),
+            age.map(|a| a.as_millis() as u64),
+            slot.state == "running" && age.is_some_and(|a| a <= self.ttl),
+        ))
+    }
+
     pub fn known(&self, camera_id: &str) -> bool {
         self.inner
             .lock()

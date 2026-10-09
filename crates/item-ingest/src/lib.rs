@@ -8,6 +8,7 @@
 //! already done decode+detect, we only deduplicate and persist its events.
 
 pub mod annotate;
+pub mod annotations;
 pub mod assets;
 pub mod config;
 pub mod daemon;
@@ -52,7 +53,7 @@ pub type Result<T> = std::result::Result<T, IngestError>;
 /// `(id, is_new)` pair existed only to name the snapshot file, and callers saw
 /// a bare count. `hits` is reported as of this sighting, so a later
 /// disappearance can say how often the object was seen before it went
-/// (docs/resident-ingest.md §6).
+/// (design/resident-ingest.md §6).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recorded {
     pub obs_id: i64,

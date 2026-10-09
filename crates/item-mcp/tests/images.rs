@@ -139,6 +139,7 @@ impl Daemon {
                     };
                     let conflicting = path.contains("/observations/3/");
                     let is_frame = id == "frame-test";
+                    let is_evidence = id.starts_with("evidence-v1-");
                     let metadata = RawAssetMetadata {
                         database_id: database_id.clone(),
                         asset_id: id.into(),
@@ -157,20 +158,26 @@ impl Daemon {
                         } else {
                             "2026-10-08T10:00:00Z".into()
                         }),
-                        observation_id: if is_frame {
+                        observation_id: if is_frame || is_evidence {
                             None
                         } else {
                             Some(if conflicting { 3 } else { 1 })
                         },
                         camera_id: Some("test-cam".into()),
-                        zone: if is_frame { None } else { Some("desk".into()) },
+                        zone: if is_frame || is_evidence {
+                            None
+                        } else {
+                            Some("desk".into())
+                        },
                         status: "available".into(),
                         provenance: if is_frame {
                             "daemon_camera_frame".into()
+                        } else if is_evidence {
+                            "daemon_annotation_evidence".into()
                         } else {
                             "daemon_raw_asset".into()
                         },
-                        expires_at: if is_frame {
+                        expires_at: if is_frame || is_evidence {
                             Some(frame_expiry.clone())
                         } else {
                             None
@@ -276,10 +283,16 @@ fn stdio_returns_verified_raw_image_and_metadata_and_recovers_from_errors() {
     assert_eq!(frame["images"][0]["zone"], Value::Null);
     assert!(frame["images"][0]["expires_at"].is_string());
     assert_eq!(frame["images"][0]["provenance"], "daemon_camera_frame");
-    let reread = client.tool(
-        9,
+    client.tool_error(
+        10,
         "get_item_images",
-        json!({"image_kind":"raw","asset_ids":["frame-test"]}),
+        json!({"image_kind":"raw","asset_ids":["frame-test"],"camera_id":"other-camera"}),
+        "camera_mismatch",
+    );
+    let reread = client.tool(
+        11,
+        "get_item_images",
+        json!({"image_kind":"raw","asset_ids":["frame-test"],"camera_id":"test-cam"}),
     );
     assert_eq!(reread["images"][0]["observation_id"], Value::Null);
     assert_eq!(
@@ -311,6 +324,53 @@ fn stdio_returns_verified_raw_image_and_metadata_and_recovers_from_errors() {
         "get_item_images",
         json!({"image_kind":"raw","observation_ids":[1]}),
         "dataset_mismatch",
+    );
+    client.finish();
+}
+
+#[test]
+fn annotation_evidence_images_are_verified_independently_and_camera_guard_is_exact() {
+    let daemon = Daemon::new();
+    let mut client = Client::start_with_daemon(
+        true,
+        Some(&daemon.db),
+        None,
+        Some((&daemon.endpoint, "test-secret")),
+    );
+    client.initialize("2025-11-25");
+    let id = "evidence-v1-1234567890abcdef";
+    let first = client.tool(
+        2,
+        "get_item_images",
+        json!({"image_kind":"raw","asset_ids":[id],"camera_id":"test-cam"}),
+    );
+    assert_eq!(
+        first["images"][0]["provenance"],
+        "daemon_annotation_evidence"
+    );
+    assert_eq!(first["images"][0]["observation_id"], Value::Null);
+    assert_eq!(first["images"][0]["zone"], Value::Null);
+    client.tool_error(
+        3,
+        "get_item_images",
+        json!({"image_kind":"raw","asset_ids":[id],"camera_id":"other"}),
+        "camera_mismatch",
+    );
+    let second = client.tool(
+        4,
+        "get_item_images",
+        json!({"image_kind":"raw","asset_ids":[id]}),
+    );
+    assert_eq!(first["images"][0]["sha256"], second["images"][0]["sha256"]);
+    assert_eq!(
+        first["images"][0]["expires_at"],
+        second["images"][0]["expires_at"]
+    );
+    client.tool_error(
+        5,
+        "get_item_images",
+        json!({"image_kind":"raw","asset_ids":["evidence-v1-NOTHEX"]}),
+        "invalid_daemon_response",
     );
     client.finish();
 }

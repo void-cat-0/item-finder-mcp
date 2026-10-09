@@ -1,4 +1,4 @@
-//! The liveness file (docs/resident-ingest.md §5).
+//! The liveness file (design/resident-ingest.md §5).
 //!
 //! A file rather than an HTTP endpoint: `item-web` has no HTTP client, and 15s
 //! granularity is plenty for "is the ingest daemon alive". The only field that

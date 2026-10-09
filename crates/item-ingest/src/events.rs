@@ -1,5 +1,5 @@
 //! Event observation: the appeared/disappeared timeline as an append-only JSONL
-//! file (docs/resident-ingest.md §6).
+//! file (design/resident-ingest.md §6).
 //!
 //! This is the evidence the v2 events table will be designed against, so it is
 //! deliberately produced **without touching the schema**: nothing here talks to

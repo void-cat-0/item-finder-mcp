@@ -77,6 +77,10 @@ fn real_daemon_raw_asset_survives_restart_and_stdio_queries_survive_daemon_stop(
         Some((&endpoint, "fixture-secret")),
     );
     client.initialize("2025-11-25");
+    let cameras = client.tool(20, "list_cameras", json!({}));
+    assert_eq!(cameras["cameras"].as_array().unwrap().len(), 0);
+    let health = client.tool(21, "get_health", json!({}));
+    assert_eq!(health["daemon_state"], "running");
     let response = client.request(
         2,
         "tools/call",

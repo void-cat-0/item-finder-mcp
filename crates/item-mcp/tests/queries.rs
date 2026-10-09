@@ -170,7 +170,7 @@ fn missing_database_can_appear_without_restarting_and_empty_is_not_an_error() {
     client.initialize("2025-03-26");
     client.tool_error(2, "list_recorded_items", json!({}), "database_unavailable");
     let info = client.tool(3, "server_info", json!({}));
-    assert_eq!(info["mode"], "queries_and_camera_frames");
+    assert_eq!(info["mode"], "queries_only");
     assert!(!db.exists(), "query created missing database");
     let store = Store::open(&db).unwrap();
     let result = client.tool(4, "list_observations", json!({}));

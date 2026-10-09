@@ -14,7 +14,7 @@
 #   4. ReadWritePaths   every directory the config writes into
 #
 # Absolute paths matter here. The daemon resolves relative paths against the
-# CONFIG FILE's directory (docs/resident-ingest.md §3), not the cwd, so a
+# CONFIG FILE's directory (design/resident-ingest.md §3), not the cwd, so a
 # config that says `db = "data/items.db"` writes next to the config file --
 # put the config and its data directory in the same tree, or use absolute
 # paths in the config. Listing /etc/where-i-put as writable would be the
@@ -36,7 +36,7 @@ ExecStart=/opt/where-i-put/item-ingest --daemon --config /etc/where-i-put/config
 # The daemon exits 0 on a stop signal and non-zero only on a real failure, so
 # this restarts what crashed and not what was stopped on purpose. A killed
 # daemon leaves a lock whose heartbeat stops; the next start takes it over
-# (docs/resident-ingest.md §8), which is what makes this line useful.
+# (design/resident-ingest.md §8), which is what makes this line useful.
 Restart=on-failure
 RestartSec=5
 

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Instant;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use item_core::Observation;
@@ -54,6 +55,8 @@ pub struct LocateRequest {
 #[serde(deny_unknown_fields)]
 pub struct GetRequest {
     pub observation_id: i64,
+    /// Optional exact camera ID guard for multi-camera callers.
+    pub camera_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -138,6 +141,10 @@ pub struct GetResponse {
     pub note: &'static str,
 }
 
+#[cfg(test)]
+#[path = "query_budget_tests.rs"]
+mod budget_tests;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Database {
     path: PathBuf,
@@ -185,6 +192,68 @@ impl Database {
                 "The configured database could not be read. Check the database configuration and ingest service.",
             )
         })
+    }
+
+    /// Read-side geometry admission. The deadline starts before semaphore admission;
+    /// the permit is moved into blocking work and remains held through cancellation.
+    pub async fn read_snapshot<T, F>(
+        &self,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        operation: F,
+    ) -> Result<T, CallToolResult>
+    where
+        T: Send + 'static,
+        F: FnOnce(&item_core::evidence::ReadSnapshot<'_>) -> item_core::store::Result<T>
+            + Send
+            + 'static,
+    {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let permit = tokio::time::timeout(wait, self.permits.clone().acquire_owned())
+            .await
+            .map_err(|_| tool_error("timeout", "The geometry request exceeded its deadline."))?
+            .map_err(|_| tool_error("internal", "The query service is unavailable."))?;
+        let path = self.path.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let control = item_core::evidence::ReadControl::new(deadline, cancelled);
+            let store = Store::open_read_only_controlled(path, control.clone())?;
+            let snapshot = store.read_snapshot(control)?;
+            operation(&snapshot)
+        });
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task)
+            .await
+            .map_err(|_| tool_error("timeout", "The geometry request exceeded its deadline."))?
+            .map_err(|_| tool_error("internal", "The geometry query could not be completed."))?
+            .map_err(store_error)
+    }
+}
+
+pub(crate) fn store_error(error: item_core::store::StoreError) -> CallToolResult {
+    use item_core::store::StoreError;
+    match error {
+        StoreError::ReadTimeout => {
+            tool_error("timeout", "The geometry request exceeded its deadline.")
+        }
+        StoreError::ReadCancelled => tool_error("cancelled", "The geometry request was cancelled."),
+        StoreError::PayloadTooLarge => tool_error(
+            "payload_too_large",
+            "Necessary database evidence exceeds the response budget.",
+        ),
+        StoreError::ObservationNotFound => {
+            tool_error("not_found", "No observation with this ID is recorded.")
+        }
+        StoreError::CameraMismatch => tool_error(
+            "camera_mismatch",
+            "The observation does not belong to the requested camera.",
+        ),
+        StoreError::InvalidInput(_) => {
+            tool_error("invalid_input", "The geometry request is invalid.")
+        }
+        _ => tool_error(
+            "database_unavailable",
+            "The configured database could not be read.",
+        ),
     }
 }
 

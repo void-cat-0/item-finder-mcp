@@ -1,5 +1,5 @@
 //! `CameraRunner`: one camera's decode -> throttle -> detect -> persist
-//! pipeline expressed as repeatedly-callable steps (docs/resident-ingest.md §2).
+//! pipeline expressed as repeatedly-callable steps (design/resident-ingest.md §2).
 //!
 //! `step()` deliberately never loops internally. The stop flag, health
 //! reporting and (in P4) the event checkpoints all hang off that single check
@@ -32,7 +32,7 @@ pub enum StepOutcome {
 }
 
 /// Coarse camera state, mirroring the `cameras[].state` field of the health
-/// snapshot (docs/resident-ingest.md §5).
+/// snapshot (design/resident-ingest.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraState {
     Starting,

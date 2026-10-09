@@ -262,6 +262,7 @@ async fn current_frame_roundtrip_preserves_encoded_id_and_has_no_observation() {
                 image_kind: ImageKind::Raw,
                 observation_ids: vec![],
                 asset_ids: vec!["frame-test".into()],
+                camera_id: None,
                 max_images: None,
                 max_bytes_each: None,
             },

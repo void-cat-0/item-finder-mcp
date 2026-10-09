@@ -113,7 +113,8 @@ tooling quirks, and a volatile session-state snapshot. Read it before
 working on this repo, and write new machine-specific facts there rather
 than into any single tool's private memory. The split:
 
-- Durable + project-scoped → this file, `README.md`, or `docs/` (tracked).
+- Durable + project-scoped usage/operational guidance → this file, `README.md`, or `docs/` (tracked).
+- Design documents and API/architecture plans → `design/` (git-ignored, local only). Do not add or force-track this directory; a fresh clone will not contain these files.
 - Machine/environment-specific or secret → `AGENT-MEMORIES/` (ignored).
 
 Never commit that folder, never "clean it up", and never copy its contents

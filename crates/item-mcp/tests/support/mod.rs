@@ -41,8 +41,27 @@ impl Client {
         env_db: Option<&std::path::Path>,
         daemon: Option<(&str, &str)>,
     ) -> Self {
+        Self::start_with_annotations(explicit_stdio, db, env_db, daemon, false, None)
+    }
+
+    pub(crate) fn start_with_annotations(
+        explicit_stdio: bool,
+        db: Option<&std::path::Path>,
+        env_db: Option<&std::path::Path>,
+        daemon: Option<(&str, &str)>,
+        enabled: bool,
+        write_token: Option<&str>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_item-mcp"));
+        command.env_remove("ITEM_DAEMON_ANNOTATION_TOKEN");
+        if enabled {
+            command.arg("--enable-annotations");
+        }
+        if let Some(token) = write_token {
+            command.env("ITEM_DAEMON_ANNOTATION_TOKEN", token);
+        }
         command.env_remove("ITEM_DB");
+        command.env_remove("ITEM_PRIORS");
         command.env_remove("ITEM_DAEMON_ENDPOINT");
         command.env_remove("ITEM_DAEMON_TOKEN");
         if let Some((endpoint, token)) = daemon {
@@ -90,6 +109,15 @@ impl Client {
             stdout: Some(stdout),
             stderr: Some(stderr),
         }
+    }
+
+    pub(crate) fn raw_request(&mut self, text: &str) -> Value {
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{text}").unwrap();
+        stdin.flush().unwrap();
+        self.messages
+            .recv_timeout(TIMEOUT)
+            .expect("MCP raw response")
     }
 
     fn send(&mut self, message: Value) {

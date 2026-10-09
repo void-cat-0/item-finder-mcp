@@ -3,7 +3,7 @@
 //! Regions are rows in SQLite, so everything else -- webhook, camera loop,
 //! query -- keeps reading from the store, not from TOML.
 //!
-//! Precedence, lowest to highest (docs/resident-ingest.md §4):
+//! Precedence, lowest to highest (design/resident-ingest.md §4):
 //!
 //! ```text
 //! built-in defaults -> config.toml -> environment -> explicit CLI flags
@@ -102,13 +102,18 @@ pub mod defaults {
     /// constraint in `item-ingest::retention` before lowering this**: the v2
     /// rule engine (README Roadmap step 3) infers containment from
     /// disappearances, and the evidence it needs is exactly what this window
-    /// deletes -- no later run can recreate it (docs/resident-ingest.md §7).
+    /// deletes -- no later run can recreate it (design/resident-ingest.md §7).
     pub const RETENTION_DAYS: u64 = 90;
     /// How often expired observations are pruned.
     pub const SWEEP_SECS: u64 = 3600;
     /// How often the snapshots directory is scanned for files whose row is
     /// gone. Weekly: it is a repair pass, not the primary cleanup.
     pub const RECONCILE_SECS: u64 = 7 * 24 * 3600;
+    pub const ANNOTATION_RETENTION_DAYS: u64 = 30;
+    pub const ANNOTATION_MAX_SETS: u64 = 10_000;
+    pub const ANNOTATION_MAX_REVISIONS: u64 = 50_000;
+    pub const ANNOTATION_MAX_METADATA_BYTES: u64 = 512 * 1024 * 1024;
+    pub const ANNOTATION_MAX_EVIDENCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     /// Grounding is one HTTP round trip per detection against a local LLM, so
     /// the VLM default is far below the local-detector one.
     pub const DETECT_FPS_VLM: f64 = 0.2;
@@ -133,7 +138,7 @@ pub struct DaemonConfig {
     pub snapshots: Option<String>,
     pub health_file: Option<String>,
     /// Where the appeared/disappeared timeline is appended; `""` = produce no
-    /// events (docs/resident-ingest.md §6).
+    /// events (design/resident-ingest.md §6).
     pub events_file: Option<String>,
     /// 0 = never reload config.toml while running (phase 2 feature).
     pub rescan_config_secs: Option<u64>,
@@ -155,6 +160,18 @@ pub struct DaemonConfig {
     pub frame_cache_ttl_ms: Option<u64>,
     /// Frozen camera-frame asset lifetime in seconds (1..=86400).
     pub frame_asset_ttl_secs: Option<u64>,
+    /// Enable authenticated annotation submissions. Defaults to false.
+    pub annotations_enabled: Option<bool>,
+    /// Annotation set retention in days (1..=365).
+    pub annotation_retention_days: Option<u64>,
+    /// Maximum retained annotation sets.
+    pub annotation_max_sets: Option<u64>,
+    /// Maximum retained annotation revisions.
+    pub annotation_max_revisions: Option<u64>,
+    /// Logical JSON metadata budget in bytes.
+    pub annotation_max_metadata_bytes: Option<u64>,
+    /// Physical evidence JPEG budget in bytes.
+    pub annotation_max_evidence_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -172,7 +189,7 @@ pub struct CameraConfig {
     pub url: Option<String>,
     /// Local/USB camera index (feature `camera`). **Not portable**: DirectShow,
     /// V4L2 and AVFoundation enumerate different devices, so this is a
-    /// per-machine value in a way `url` is not (docs/resident-ingest.md §9).
+    /// per-machine value in a way `url` is not (design/resident-ingest.md §9).
     /// Ignored when `url` is also set.
     #[serde(default)]
     pub webcam: Option<u32>,
@@ -310,6 +327,7 @@ pub struct CliOverrides {
 #[derive(Default, Clone)]
 pub struct EnvOverrides {
     pub internal_token: Option<String>,
+    pub annotation_token: Option<String>,
     pub vlm_base_url: Option<String>,
     pub vlm_model: Option<String>,
     pub depth_base_url: Option<String>,
@@ -320,6 +338,7 @@ impl EnvOverrides {
     pub fn from_env() -> Self {
         Self {
             internal_token: std::env::var("ITEM_DAEMON_TOKEN").ok(),
+            annotation_token: std::env::var("ITEM_DAEMON_ANNOTATION_TOKEN").ok(),
             vlm_base_url: std::env::var("ITEM_VLM_BASE_URL").ok(),
             vlm_model: std::env::var("ITEM_VLM_MODEL").ok(),
             // ITEM_VLM_* is a compatibility fallback for the depth backend;
@@ -357,6 +376,13 @@ pub struct RuntimeConfig {
     pub internal_max_asset_bytes: u64,
     pub frame_cache_ttl_ms: u64,
     pub frame_asset_ttl_secs: u64,
+    pub annotations_enabled: bool,
+    pub annotation_retention_days: u64,
+    pub annotation_max_sets: u64,
+    pub annotation_max_revisions: u64,
+    pub annotation_max_metadata_bytes: u64,
+    pub annotation_max_evidence_bytes: u64,
+    pub annotation_token: Option<String>,
     pub webhook_enabled: bool,
     pub listen: String,
     /// `None` = the preview endpoint stays off.
@@ -428,6 +454,36 @@ impl RuntimeConfig {
         }
         if !(1..=86400).contains(&self.frame_asset_ttl_secs) {
             return Err("frame_asset_ttl_secs must be between 1 and 86400".into());
+        }
+        if !(1..=365).contains(&self.annotation_retention_days) {
+            return Err("annotation_retention_days must be between 1 and 365".into());
+        }
+        if self.annotation_max_sets == 0
+            || self.annotation_max_revisions == 0
+            || self.annotation_max_metadata_bytes == 0
+            || self.annotation_max_evidence_bytes == 0
+        {
+            return Err("annotation quotas must be positive".into());
+        }
+        let valid_token = |token: Option<&String>| {
+            token.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| (0x21..=0x7e).contains(&b)))
+        };
+        if self.annotation_token.is_some() && !valid_token(self.annotation_token.as_ref()) {
+            return Err("ITEM_DAEMON_ANNOTATION_TOKEN must contain visible ASCII".into());
+        }
+        if self.annotation_token.is_some() && self.annotation_token == self.internal_token {
+            return Err("annotation token must differ from ITEM_DAEMON_TOKEN".into());
+        }
+        if self.annotations_enabled {
+            if self.internal_listen.is_none() || !valid_token(self.annotation_token.as_ref()) {
+                return Err(
+                    "annotations_enabled requires internal_listen and ITEM_DAEMON_ANNOTATION_TOKEN"
+                        .into(),
+                );
+            }
+            if self.annotation_token == self.internal_token {
+                return Err("annotation token must differ from ITEM_DAEMON_TOKEN".into());
+            }
         }
         if self.webhook_enabled {
             self.listen
@@ -541,6 +597,26 @@ impl RuntimeConfig {
                 .unwrap_or(crate::assets::DEFAULT_MAX_ASSET_BYTES),
             frame_cache_ttl_ms: daemon.and_then(|d| d.frame_cache_ttl_ms).unwrap_or(5000),
             frame_asset_ttl_secs: daemon.and_then(|d| d.frame_asset_ttl_secs).unwrap_or(600),
+            annotations_enabled: daemon.and_then(|d| d.annotations_enabled).unwrap_or(false),
+            annotation_retention_days: daemon
+                .and_then(|d| d.annotation_retention_days)
+                .unwrap_or(defaults::ANNOTATION_RETENTION_DAYS),
+            annotation_max_sets: daemon
+                .and_then(|d| d.annotation_max_sets)
+                .unwrap_or(defaults::ANNOTATION_MAX_SETS),
+            annotation_max_revisions: daemon
+                .and_then(|d| d.annotation_max_revisions)
+                .unwrap_or(defaults::ANNOTATION_MAX_REVISIONS),
+            annotation_max_metadata_bytes: daemon
+                .and_then(|d| d.annotation_max_metadata_bytes)
+                .unwrap_or(defaults::ANNOTATION_MAX_METADATA_BYTES),
+            annotation_max_evidence_bytes: daemon
+                .and_then(|d| d.annotation_max_evidence_bytes)
+                .unwrap_or(defaults::ANNOTATION_MAX_EVIDENCE_BYTES),
+            annotation_token: env
+                .annotation_token
+                .clone()
+                .filter(|value| !value.is_empty()),
             webhook_enabled: webhook.and_then(|w| w.enabled).unwrap_or(true),
             listen: take(
                 &cli.listen,
@@ -737,7 +813,7 @@ impl RuntimeConfig {
     }
 
     /// Make every path absolute, resolving relative paths against the **config
-    /// file's directory** rather than the process cwd (docs/resident-ingest.md
+    /// file's directory** rather than the process cwd (design/resident-ingest.md
     /// §3). A service manager picks the cwd, so a daemon that trusted it would
     /// write snapshots where `item-web` cannot find them.
     ///
@@ -1165,9 +1241,59 @@ internal_token = "file-secret"
     }
 
     #[test]
+    fn annotations_are_default_off_and_validate_separate_credentials() {
+        let defaults = RuntimeConfig::resolve(None, &cli(), &EnvOverrides::default()).unwrap();
+        assert!(!defaults.annotations_enabled);
+        assert_eq!(defaults.annotation_retention_days, 30);
+        assert_eq!(defaults.annotation_max_sets, 10_000);
+        assert_eq!(defaults.annotation_max_revisions, 50_000);
+        assert_eq!(defaults.annotation_max_metadata_bytes, 536_870_912);
+        assert_eq!(defaults.annotation_max_evidence_bytes, 2_147_483_648);
+        let file = parse(
+            r#"
+[daemon]
+annotations_enabled = true
+internal_listen = "127.0.0.1:8480"
+internal_token = "read-secret"
+"#,
+        );
+        for token in [
+            None,
+            Some("read-secret"),
+            Some("bad token"),
+            Some("bad\nsecret"),
+        ] {
+            let env = EnvOverrides {
+                annotation_token: token.map(str::to_string),
+                ..Default::default()
+            };
+            let settings = RuntimeConfig::resolve(Some(&file), &cli(), &env).unwrap();
+            assert!(settings.validate(Some(&file)).is_err());
+        }
+        let env = EnvOverrides {
+            annotation_token: Some("write-secret".into()),
+            ..Default::default()
+        };
+        let mut settings = RuntimeConfig::resolve(Some(&file), &cli(), &env).unwrap();
+        assert!(settings.validate(Some(&file)).is_ok());
+        assert!(!format!("{settings:?}{env:?}{file:?}").contains("secret"));
+        settings.internal_listen = None;
+        assert!(settings.validate(None).is_err());
+        settings.internal_listen = Some("127.0.0.1:8480".into());
+        for days in [0, 366] {
+            settings.annotation_retention_days = days;
+            assert!(settings.validate(None).is_err());
+        }
+        settings.annotation_retention_days = 30;
+        settings.annotation_max_evidence_bytes = 0;
+        assert!(settings.validate(None).is_err());
+    }
+
+    #[test]
     fn env_sits_between_file_and_cli() {
         let env = EnvOverrides {
             internal_token: None,
+            annotation_token: None,
             vlm_base_url: Some("http://from-env/v1".into()),
             vlm_model: Some("from-env-model".into()),
             depth_base_url: None,

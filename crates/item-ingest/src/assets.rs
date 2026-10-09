@@ -40,6 +40,7 @@ pub(crate) static RAW_LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[derive(Clone)]
 pub struct AssetStore {
     root: Arc<PathBuf>,
+    annotation_root: Arc<PathBuf>,
     max_bytes: u64,
     database_id: Arc<str>,
     token: Option<Arc<str>>,
@@ -47,6 +48,21 @@ pub struct AssetStore {
     readers: Arc<Semaphore>,
     camera_ttl: Duration,
     frame_cache: Option<crate::frame_cache::FrameCache>,
+    camera_status: Option<Arc<CameraStatus>>,
+}
+
+#[derive(Clone)]
+pub struct CameraRegistration {
+    pub camera_id: String,
+    pub enabled: bool,
+    pub source_kind: String,
+}
+
+struct CameraStatus {
+    cameras: Vec<CameraRegistration>,
+    health: crate::health::HealthRegistry,
+    started_at: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Neither filesystem paths nor bearer credentials belong in diagnostics.
@@ -115,6 +131,9 @@ impl AssetStore {
             .map_err(io::Error::other)?;
         std::fs::create_dir_all(root.as_ref())?;
         let canonical = std::fs::canonicalize(root)?;
+        // Keep existing raw-only stores free of annotation side effects.
+        // AnnotationRuntime creates this directory explicitly on startup.
+        let annotation_root = canonical.join("annotation-evidence");
         {
             let _commit = RAW_LIFECYCLE
                 .lock()
@@ -141,6 +160,7 @@ impl AssetStore {
         }
         Ok(Self {
             root: Arc::new(canonical),
+            annotation_root: Arc::new(annotation_root),
             max_bytes,
             database_id: Arc::from(database_id),
             token: token.filter(|s| !s.trim().is_empty()).map(Arc::from),
@@ -148,6 +168,167 @@ impl AssetStore {
             readers: Arc::new(Semaphore::new(MAX_READERS)),
             camera_ttl,
             frame_cache: Some(crate::frame_cache::FrameCache::new(cache_ttl)),
+            camera_status: None,
+        })
+    }
+
+    pub(crate) fn initialize_annotation_directory(&self) -> io::Result<()> {
+        self.check_root().map_err(failure_io)?;
+        std::fs::create_dir_all(self.annotation_root.as_ref())?;
+        if !std::fs::symlink_metadata(self.annotation_root.as_ref())?
+            .file_type()
+            .is_dir()
+        {
+            return Err(failure_io(AssetFailure::InvalidPath));
+        }
+        self.check_annotation_root().map_err(failure_io)
+    }
+    pub(crate) fn annotation_directory(&self) -> &Path {
+        &self.annotation_root
+    }
+    pub(crate) fn database_id(&self) -> &str {
+        &self.database_id
+    }
+    pub(crate) fn shared_store(&self) -> SharedStore {
+        self.db.clone()
+    }
+
+    /// Tiny acceptance check under RAW_LIFECYCLE then the existing Store guard.
+    /// No JPEG decode or filesystem writes occur here.
+    pub(crate) fn accept_annotation_source(
+        &self,
+        metadata: &RawAssetMetadata,
+        store: &item_core::store::Store,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AssetFailure> {
+        if metadata.database_id != self.database_id.as_ref() {
+            return Err(AssetFailure::Changed);
+        }
+        if metadata.provenance == "daemon_camera_frame" {
+            if frame_expiry(&metadata.asset_id).is_none_or(|ms| ms <= now.timestamp_millis()) {
+                return Err(AssetFailure::Missing);
+            }
+        } else if metadata.provenance == "daemon_raw_asset" {
+            let id = metadata.observation_id.ok_or(AssetFailure::Changed)?;
+            let owner = store
+                .observation_by_id(id)
+                .map_err(|_| AssetFailure::Io)?
+                .ok_or(AssetFailure::Missing)?;
+            let manifest = self.manifest(&metadata.asset_id)?;
+            if !belongs_to(&manifest, &owner, &self.database_id) {
+                return Err(AssetFailure::Missing);
+            }
+        } else {
+            return Err(AssetFailure::Changed);
+        }
+        Ok(())
+    }
+
+    pub fn with_camera_status(
+        mut self,
+        cameras: Vec<CameraRegistration>,
+        health: crate::health::HealthRegistry,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.camera_status = Some(Arc::new(CameraStatus {
+            cameras,
+            health,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            stop,
+        }));
+        self
+    }
+
+    pub fn cameras(&self) -> Result<item_core::cameras::CamerasResponse, AssetFailure> {
+        let status = self.camera_status.as_ref().ok_or(AssetFailure::Busy)?;
+        let mut cameras = Vec::new();
+        for camera in &status.cameras {
+            let health = status.health.get(&camera.camera_id);
+            let cache = self
+                .frame_cache
+                .as_ref()
+                .and_then(|c| c.status(&camera.camera_id));
+            let supported = camera.enabled && camera.source_kind != "webhook";
+            let state = if !camera.enabled {
+                "disabled".into()
+            } else if !supported {
+                "webhook_only".into()
+            } else {
+                cache
+                    .as_ref()
+                    .map(|s| s.0.clone())
+                    .unwrap_or_else(|| "starting".into())
+            };
+            cameras.push(item_core::cameras::CameraInfo {
+                camera_id: camera.camera_id.clone(),
+                enabled: camera.enabled,
+                source_kind: camera.source_kind.clone(),
+                state,
+                frame_supported: supported,
+                frame_available: supported && cache.as_ref().is_some_and(|s| s.2),
+                cached_frame_age_ms: cache.and_then(|s| s.1),
+                frames: health.as_ref().map_or(0, |h| h.frames),
+                detections: health.as_ref().map_or(0, |h| h.detections),
+                recorded: health.as_ref().map_or(0, |h| h.recorded),
+                reconnects: health.as_ref().map_or(0, |h| h.reconnects),
+                has_error: health.is_some_and(|h| h.last_error.is_some()),
+            });
+        }
+        cameras.sort_by(|a, b| a.camera_id.cmp(&b.camera_id));
+        Ok(item_core::cameras::CamerasResponse {
+            database_id: self.database_id.to_string(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            cameras,
+        })
+    }
+
+    pub fn health(&self) -> Result<item_core::cameras::DaemonHealthResponse, AssetFailure> {
+        let status = self.camera_status.as_ref().ok_or(AssetFailure::Busy)?;
+        let cameras = self.cameras()?;
+        self.check_root()?;
+        let mut count = 0;
+        let mut bytes = 0u64;
+        for (index, entry) in std::fs::read_dir(self.root.as_ref())
+            .map_err(|_| AssetFailure::Io)?
+            .enumerate()
+        {
+            if index >= MAX_DIRECTORY_ENTRIES {
+                return Err(AssetFailure::Busy);
+            }
+            let entry = entry.map_err(|_| AssetFailure::Io)?;
+            let name = entry.file_name();
+            if let Some(id) = name.to_str().and_then(|s| s.strip_suffix(".jpg"))
+                && frame_asset_id(id)
+                && entry.file_type().map_err(|_| AssetFailure::Io)?.is_file()
+            {
+                count += 1;
+                bytes = bytes.saturating_add(entry.metadata().map_err(|_| AssetFailure::Io)?.len());
+            }
+        }
+        Ok(item_core::cameras::DaemonHealthResponse {
+            database_id: cameras.database_id,
+            observed_at: cameras.observed_at,
+            started_at: status.started_at.clone(),
+            daemon_state: if status.stop.load(std::sync::atomic::Ordering::SeqCst) {
+                "stopping"
+            } else {
+                "running"
+            }
+            .into(),
+            cameras: cameras.cameras,
+            cache_bytes: self
+                .frame_cache
+                .as_ref()
+                .map_or(0, |c| c.cache_bytes() as u64),
+            cache_max_bytes: crate::frame_cache::MAX_TOTAL_BYTES as u64,
+            cache_ttl_ms: self
+                .frame_cache
+                .as_ref()
+                .map_or(0, |c| c.ttl().as_millis() as u64),
+            frame_asset_count: count,
+            frame_asset_bytes: bytes,
+            frame_asset_max_count: MAX_CAMERA_ASSETS,
+            frame_asset_max_bytes: MAX_CAMERA_ASSET_BYTES,
         })
     }
 
@@ -383,6 +564,84 @@ impl AssetStore {
         self.publish_jpeg(owner, captured_at, &bytes.bytes)
     }
 
+    /// Publish an immutable annotation evidence copy. Evidence lives in a
+    /// private subdirectory so raw-frame/observation cleanup can never claim it.
+    /// The source metadata is copied, but its expiry is not reused as evidence
+    /// expiry; the caller supplies the annotation retention deadline.
+    pub fn publish_annotation_evidence(
+        &self,
+        source: &RawAssetMetadata,
+        bytes: &[u8],
+        expires_at: &str,
+    ) -> Result<RawAssetMetadata, AssetFailure> {
+        if source.database_id != self.database_id.as_ref()
+            || source.kind != RAW_KIND
+            || source.mime_type != RAW_MIME
+            || source.camera_id.is_none()
+            || bytes.len() as u64 > self.max_bytes
+        {
+            return Err(AssetFailure::Changed);
+        }
+        let (width, height) = jpeg_dimensions(bytes)?;
+        let sha256 = hex_digest(bytes);
+        if source.sha256 != sha256 || source.width != Some(width) || source.height != Some(height) {
+            return Err(AssetFailure::Changed);
+        }
+        let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| AssetFailure::Changed)?
+            .with_timezone(&chrono::Utc);
+        if expiry <= chrono::Utc::now() {
+            return Err(AssetFailure::Missing);
+        }
+        static EVIDENCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "{}-{}-{}-{}",
+            std::process::id(),
+            EVIDENCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            sha256
+        );
+        let evidence_id = format!("evidence-v1-{}", hex_digest(nonce.as_bytes()));
+        let metadata = RawAssetMetadata {
+            asset_id: evidence_id.clone(),
+            database_id: self.database_id.to_string(),
+            kind: RAW_KIND.into(),
+            mime_type: RAW_MIME.into(),
+            bytes: bytes.len() as u64,
+            sha256: sha256.clone(),
+            width: Some(width),
+            height: Some(height),
+            capture_time: source.capture_time.clone(),
+            observation_id: None,
+            camera_id: source.camera_id.clone(),
+            zone: None,
+            status: "available".into(),
+            provenance: "daemon_annotation_evidence".into(),
+            expires_at: Some(expires_at.to_owned()),
+        };
+        let manifest = serde_json::to_vec(&Manifest {
+            schema: 1,
+            label: String::new(),
+            metadata: metadata.clone(),
+        })
+        .map_err(|_| AssetFailure::Io)?;
+        if manifest.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(AssetFailure::TooLarge);
+        }
+        // The annotation operation mutex protects this directory from its
+        // cleanup. Do not hold the source lifecycle or Store lock over disk IO.
+        self.check_annotation_root()?;
+        self.publish_file_at(&self.annotation_root, &format!("{evidence_id}.jpg"), bytes)
+            .map_err(map_io)?;
+        self.publish_file_at(
+            &self.annotation_root,
+            &format!("{evidence_id}.json"),
+            &manifest,
+        )
+        .map_err(map_io)?;
+        Ok(metadata)
+    }
+
     pub fn publish_jpeg(
         &self,
         owner: &Observation,
@@ -455,12 +714,14 @@ impl AssetStore {
     }
 
     fn publish_file(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        self.check_root().map_err(failure_io)?;
-        let final_path = self.root.join(name);
+        self.publish_file_at(&self.root, name, bytes)
+    }
+
+    fn publish_file_at(&self, root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let final_path = root.join(name);
         if final_path.exists() {
-            let existing = self
-                .read_file(&final_path, bytes.len() as u64)
-                .map_err(failure_io)?;
+            let existing =
+                bounded_read(root, &final_path, bytes.len() as u64).map_err(failure_io)?;
             return if existing == bytes {
                 Ok(())
             } else {
@@ -468,7 +729,7 @@ impl AssetStore {
             };
         }
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let temp = self.root.join(format!(
+        let temp = root.join(format!(
             ".raw-{}-{}.tmp",
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -486,9 +747,8 @@ impl AssetStore {
             match std::fs::hard_link(&temp, &final_path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let existing = self
-                        .read_file(&final_path, bytes.len() as u64)
-                        .map_err(failure_io)?;
+                    let existing =
+                        bounded_read(root, &final_path, bytes.len() as u64).map_err(failure_io)?;
                     if existing == bytes {
                         Ok(())
                     } else {
@@ -509,6 +769,63 @@ impl AssetStore {
             return Err(AssetFailure::InvalidPath);
         }
         Ok(())
+    }
+
+    fn check_annotation_root(&self) -> Result<(), AssetFailure> {
+        self.check_root()?;
+        if std::fs::canonicalize(self.annotation_root.as_ref())
+            .map_err(|_| AssetFailure::InvalidPath)?
+            != *self.annotation_root
+        {
+            return Err(AssetFailure::InvalidPath);
+        }
+        Ok(())
+    }
+
+    /// Read an annotation evidence asset after validating its independent
+    /// manifest and JPEG hash. This path never consults source/frame expiry.
+    pub fn annotation_evidence_content(
+        &self,
+        asset_id: &str,
+    ) -> Result<(RawAssetMetadata, Vec<u8>), AssetFailure> {
+        if !annotation_asset_id(asset_id) {
+            return Err(AssetFailure::NotFound);
+        }
+        self.check_annotation_root()?;
+        let manifest_bytes = bounded_read(
+            &self.annotation_root,
+            &self.annotation_root.join(format!("{asset_id}.json")),
+            MAX_MANIFEST_BYTES,
+        )?;
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| AssetFailure::Changed)?;
+        validate_annotation_manifest(&manifest, asset_id, self.database_id.as_ref())?;
+        let mut metadata = manifest.metadata;
+        // Evidence lifetime is DB-owned and may extend when another live set
+        // shares this generation. Never trust a stale filesystem expiry.
+        if let Some(db) = Some(self.db.clone()) {
+            let guard = db.lock().map_err(|_| AssetFailure::Io)?;
+            let Some((_registration, expiry)) = guard
+                .annotation_evidence_by_id(asset_id, chrono::Utc::now())
+                .map_err(|_| AssetFailure::Io)?
+            else {
+                return Err(AssetFailure::Missing);
+            };
+            metadata.expires_at = Some(expiry);
+        }
+        let bytes = bounded_read(
+            &self.annotation_root,
+            &self.annotation_root.join(format!("{asset_id}.jpg")),
+            self.max_bytes,
+        )?;
+        if bytes.len() as u64 != metadata.bytes || hex_digest(&bytes) != metadata.sha256 {
+            return Err(AssetFailure::Changed);
+        }
+        let (width, height) = jpeg_dimensions(&bytes)?;
+        if metadata.width != Some(width) || metadata.height != Some(height) {
+            return Err(AssetFailure::Changed);
+        }
+        Ok((metadata, bytes))
     }
 
     fn read_file(&self, path: &Path, limit: u64) -> Result<Vec<u8>, AssetFailure> {
@@ -569,6 +886,9 @@ impl AssetStore {
     }
 
     pub fn content(&self, asset_id: &str) -> Result<(RawAssetMetadata, Vec<u8>), AssetFailure> {
+        if annotation_asset_id(asset_id) {
+            return self.annotation_evidence_content(asset_id);
+        }
         let manifest = self.manifest(asset_id)?;
         if manifest.metadata.provenance == "daemon_camera_frame" {
             let metadata = manifest.metadata;
@@ -666,7 +986,7 @@ impl AssetStore {
         }
     }
 
-    fn authorized(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn authorized(&self, headers: &HeaderMap) -> bool {
         let Some(token) = self.token.as_deref() else {
             return false;
         };
@@ -735,6 +1055,57 @@ fn validate_manifest(manifest: &Manifest, asset_id: &str, id: i64) -> Result<(),
         return Err(AssetFailure::Changed);
     }
     Ok(())
+}
+
+pub(crate) fn annotation_asset_id_public(id: &str) -> bool {
+    annotation_asset_id(id)
+}
+
+fn annotation_asset_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("evidence-v1-") else {
+        return false;
+    };
+    (16..=128).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_annotation_manifest(
+    manifest: &Manifest,
+    asset_id: &str,
+    database_id: &str,
+) -> Result<(), AssetFailure> {
+    let m = &manifest.metadata;
+    let (Some(camera), Some(_capture), Some(expiry), Some(width), Some(height)) = (
+        &m.camera_id,
+        &m.capture_time,
+        &m.expires_at,
+        m.width,
+        m.height,
+    ) else {
+        return Err(AssetFailure::Changed);
+    };
+    let _expiry =
+        chrono::DateTime::parse_from_rfc3339(expiry).map_err(|_| AssetFailure::Changed)?;
+    if manifest.schema != 1
+        || !manifest.label.is_empty()
+        || m.asset_id != asset_id
+        || m.database_id != database_id
+        || m.kind != RAW_KIND
+        || m.mime_type != RAW_MIME
+        || m.status != "available"
+        || m.provenance != "daemon_annotation_evidence"
+        || m.observation_id.is_some()
+        || m.zone.is_some()
+        || camera.is_empty()
+        || camera.len() > 1024
+        || camera == "."
+        || camera == ".."
+        || camera.chars().any(char::is_control)
+        || m.bytes == 0
+        || m.bytes > DEFAULT_MAX_ASSET_BYTES
+    {
+        return Err(AssetFailure::Changed);
+    }
+    dimensions(width, height)
 }
 
 fn frame_expiry(id: &str) -> Option<i64> {
@@ -1039,6 +1410,8 @@ struct ApiState {
 /// Host/Origin authority; browsers are never granted cross-origin access.
 pub fn router(store: AssetStore, address: std::net::SocketAddr) -> Router {
     Router::new()
+        .route("/internal/v1/cameras", get(cameras_handler))
+        .route("/internal/v1/health", get(health_handler))
         .route("/internal/v1/assets/{asset_id}", get(metadata_handler))
         .route(
             "/internal/v1/assets/{asset_id}/content",
@@ -1267,6 +1640,24 @@ async fn frame_handler(
         Ok(Err(e)) => error_response(e.status(), e.body()),
         Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, AssetFailure::Io.body()),
     }
+}
+
+async fn cameras_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    blocking_response(state, headers, |store| {
+        store
+            .cameras()
+            .map(|value| json_response(StatusCode::OK, &value))
+    })
+    .await
+}
+
+async fn health_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    blocking_response(state, headers, |store| {
+        store
+            .health()
+            .map(|value| json_response(StatusCode::OK, &value))
+    })
+    .await
 }
 
 async fn metadata_handler(

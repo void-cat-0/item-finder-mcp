@@ -101,7 +101,7 @@ where
         write_timeout,
     };
     BoundedTransport {
-        inner: AsyncRwTransport::new_server(read, writer),
+        inner: AsyncRwTransport::new_server(StrictInput::new(read), writer),
         shared,
         pending: None,
         eof: false,
@@ -113,6 +113,138 @@ where
 pub fn stdio() -> BoundedTransport<impl Transport<RoleServer, Error = io::Error> + 'static> {
     let (read, write) = rmcp::transport::stdio();
     from_io(read, write, WRITE_TIMEOUT)
+}
+
+/// One bounded input line, inspected before the SDK turns arguments into Value.
+/// Duplicate object keys are replaced by a well-formed but invalid protocol frame;
+/// the SDK emits Invalid Request and keeps reading. No user payload is logged.
+struct StrictInput<R> {
+    inner: tokio::io::BufReader<R>,
+    line: Vec<u8>,
+    output: Vec<u8>,
+    offset: usize,
+    eof: bool,
+}
+const MAX_INPUT_LINE: usize = 512 * 1024;
+impl<R: AsyncRead> StrictInput<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner: tokio::io::BufReader::new(inner),
+            line: Vec::new(),
+            output: Vec::new(),
+            offset: 0,
+            eof: false,
+        }
+    }
+}
+impl<R: AsyncRead + Unpin> AsyncRead for StrictInput<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use tokio::io::AsyncBufRead;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if self.offset < self.output.len() {
+                let n = buf.remaining().min(self.output.len() - self.offset);
+                buf.put_slice(&self.output[self.offset..self.offset + n]);
+                self.offset += n;
+                return Poll::Ready(Ok(()));
+            }
+            self.output.clear();
+            self.offset = 0;
+            if self.eof {
+                return Poll::Ready(Ok(()));
+            }
+            let this = &mut *self;
+            let available = match Pin::new(&mut this.inner).poll_fill_buf(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(available)) => available,
+            };
+            let eof = available.is_empty();
+            let n = available
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(available.len(), |n| n + 1);
+            if this.line.len() + n > MAX_INPUT_LINE {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP input exceeds 512 KiB",
+                )));
+            }
+            this.line.extend_from_slice(&available[..n]);
+            Pin::new(&mut this.inner).consume(n);
+            if eof || this.line.last() == Some(&b'\n') {
+                this.eof = eof;
+                let json = this
+                    .line
+                    .strip_prefix(b"\xef\xbb\xbf")
+                    .unwrap_or(&this.line);
+                let mut parser = serde_json::Deserializer::from_slice(json);
+                if matches!(serde::de::DeserializeSeed::deserialize(UniqueKeys, &mut parser), Err(e) if e.to_string().contains("duplicate JSON key"))
+                {
+                    this.line.clear();
+                    this.output
+                        .extend_from_slice(b"{\"duplicate_json_keys_rejected\":true}\n");
+                } else {
+                    std::mem::swap(&mut this.output, &mut this.line);
+                    this.line.clear();
+                }
+            }
+        }
+    }
+}
+struct UniqueKeys;
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueKeys {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without duplicate object keys")
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(UniqueKeys)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut keys = std::collections::HashSet::<String>::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate JSON key"));
+            }
+            map.next_value_seed(UniqueKeys)?;
+        }
+        Ok(())
+    }
 }
 
 struct TerminalWriter<W> {

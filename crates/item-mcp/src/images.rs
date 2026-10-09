@@ -20,6 +20,46 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 16 * 1024;
 const MAX_CAMERA_ID_BYTES: usize = 1024;
+const MAX_STATUS_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CameraInfoResponse {
+    pub camera_id: String,
+    pub enabled: bool,
+    pub source_kind: String,
+    pub state: String,
+    pub frame_supported: bool,
+    pub frame_available: bool,
+    pub cached_frame_age_ms: Option<u64>,
+    pub frames: u64,
+    pub detections: u64,
+    pub recorded: u64,
+    pub reconnects: u64,
+    pub has_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CamerasResponse {
+    pub database_id: String,
+    pub observed_at: String,
+    pub cameras: Vec<CameraInfoResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HealthResponse {
+    pub database_id: String,
+    pub observed_at: String,
+    pub started_at: String,
+    pub daemon_state: String,
+    pub cameras: Vec<CameraInfoResponse>,
+    pub cache_bytes: u64,
+    pub cache_max_bytes: u64,
+    pub cache_ttl_ms: u64,
+    pub frame_asset_count: usize,
+    pub frame_asset_bytes: u64,
+    pub frame_asset_max_count: usize,
+    pub frame_asset_max_bytes: u64,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +78,8 @@ pub struct ImagesRequest {
     /// Opaque asset IDs returned by the daemon, including frozen camera frames; paths and URLs are forbidden.
     #[serde(default)]
     pub asset_ids: Vec<String>,
+    /// Optional exact camera_id guard. Every selected asset must belong to this camera.
+    pub camera_id: Option<String>,
     /// Number of images, 1–8; default 4. Newest capture first, then asset ID.
     pub max_images: Option<usize>,
     /// Maximum JPEG bytes per image, 1–8388608; default 4194304.
@@ -139,6 +181,8 @@ pub struct DaemonClient {
     client: Client,
     endpoint: Url,
     authorization: reqwest::header::HeaderValue,
+    annotation_authorization: Option<reqwest::header::HeaderValue>,
+    pub(crate) annotation_permits: Arc<Semaphore>,
     permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
     timeout: Duration,
@@ -173,15 +217,93 @@ impl DaemonClient {
             client,
             endpoint,
             authorization,
+            annotation_authorization: None,
+            annotation_permits: Arc::new(Semaphore::new(2)),
             permits: Arc::new(Semaphore::new(4)),
             cpu_permits: Arc::new(Semaphore::new(4)),
             timeout,
         })
     }
 
+    /// Explicit write capability, separate from the daemon read credential.
+    pub fn with_annotations(mut self, token: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !token.trim().is_empty(),
+            "annotation token must not be empty"
+        );
+        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("invalid annotation token"))?;
+        anyhow::ensure!(
+            authorization != self.authorization,
+            "annotation and read tokens must differ"
+        );
+        authorization.set_sensitive(true);
+        self.annotation_authorization = Some(authorization);
+        Ok(self)
+    }
+
+    pub fn annotations_enabled(&self) -> bool {
+        self.annotation_authorization.is_some()
+    }
+
+    pub(crate) fn annotation_request(
+        &self,
+        method: reqwest::Method,
+        segments: &[&str],
+        write: bool,
+    ) -> Result<reqwest::RequestBuilder, CallToolResult> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| invalid_response())?
+            .clear()
+            .extend(segments);
+        let authorization = if write {
+            self.annotation_authorization.as_ref().ok_or_else(|| {
+                tool_error(
+                    "annotation_disabled",
+                    "Annotation submission is not enabled.",
+                )
+            })?
+        } else {
+            &self.authorization
+        };
+        Ok(self
+            .client
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, authorization.clone()))
+    }
+
     /// Start before database identity lookup so all response generation shares this budget.
     pub fn deadline(&self) -> tokio::time::Instant {
         tokio::time::Instant::now() + self.timeout
+    }
+
+    pub async fn cameras(&self, database_id: String) -> Result<CamerasResponse, CallToolResult> {
+        let response = self.get("internal/v1/cameras").await?;
+        let bytes = bounded_body(response, MAX_STATUS_BYTES).await?;
+        let value: CamerasResponse =
+            serde_json::from_slice(&bytes).map_err(|_| invalid_response())?;
+        if value.database_id != database_id {
+            return Err(tool_error(
+                "dataset_mismatch",
+                "The daemon and query database do not share the same source identity.",
+            ));
+        }
+        Ok(value)
+    }
+
+    pub async fn health(&self, database_id: String) -> Result<HealthResponse, CallToolResult> {
+        let response = self.get("internal/v1/health").await?;
+        let bytes = bounded_body(response, MAX_STATUS_BYTES).await?;
+        let value: HealthResponse =
+            serde_json::from_slice(&bytes).map_err(|_| invalid_response())?;
+        if value.database_id != database_id {
+            return Err(tool_error(
+                "dataset_mismatch",
+                "The daemon and query database do not share the same source identity.",
+            ));
+        }
+        Ok(value)
     }
 
     pub async fn images(
@@ -315,6 +437,12 @@ impl DaemonClient {
         max_images: usize,
         max_bytes_each: usize,
     ) -> Result<CallToolResult, CallToolResult> {
+        if let Some(camera_id) = request.camera_id.as_deref()
+            && !valid_camera_id(camera_id)
+        {
+            return Err(tool_error("invalid_input", "camera_id is invalid."));
+        }
+        let requested_camera = request.camera_id.clone();
         let mut metadata = Vec::new();
         for id in request.observation_ids.into_iter().collect::<BTreeSet<_>>() {
             let asset = self
@@ -323,12 +451,30 @@ impl DaemonClient {
             if asset.observation_id != Some(id) || asset.provenance != "daemon_raw_asset" {
                 return Err(invalid_response());
             }
+            if requested_camera
+                .as_deref()
+                .is_some_and(|camera| asset.camera_id.as_deref() != Some(camera))
+            {
+                return Err(tool_error(
+                    "camera_mismatch",
+                    "The selected raw asset belongs to another camera.",
+                ));
+            }
             metadata.push(asset);
         }
         for id in request.asset_ids.into_iter().collect::<BTreeSet<_>>() {
             let asset = self.metadata(&format!("internal/v1/assets/{id}")).await?;
             if asset.asset_id != id {
                 return Err(invalid_response());
+            }
+            if requested_camera
+                .as_deref()
+                .is_some_and(|camera| asset.camera_id.as_deref() != Some(camera))
+            {
+                return Err(tool_error(
+                    "camera_mismatch",
+                    "The selected raw asset belongs to another camera.",
+                ));
             }
             metadata.push(asset);
         }
@@ -488,7 +634,7 @@ impl DaemonClient {
             note: if is_frame {
                 "Immutable unannotated JPEG captured at capture_time. age_ms and camera_state describe the daemon freeze time, not delivery time or current presence. The expiring opaque asset can be reread with get_item_images without capturing again. No observation or visual inference is created. content_index identifies the image block."
             } else {
-                "Raw evidence is an unannotated captured frame, not a visual inference or proof of current presence. Image blocks follow metadata order; content_index identifies each block. Independent camera frame assets have no observation and can be read only until expires_at."
+                "Raw evidence is an unannotated captured frame, not a visual inference or proof of current presence. Image blocks follow metadata order; content_index identifies each block. Independent camera frame and annotation evidence assets have no observation and can be read only until their own expires_at. Annotation evidence preserves the original JPEG, not current presence; it does not renew the source frame expiry."
             },
         };
         // JSON/text generation can copy megabytes; keep it off the async executor and
@@ -642,6 +788,30 @@ fn validate_metadata(asset: &RawAssetMetadata) -> Result<(), CallToolResult> {
                 return Err(invalid_response());
             }
         }
+        "daemon_annotation_evidence"
+            if asset
+                .asset_id
+                .strip_prefix("evidence-v1-")
+                .is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                })
+                && asset.observation_id.is_none()
+                && asset.zone.is_none()
+                && asset.camera_id.as_deref().is_some_and(valid_camera_id)
+                && asset.expires_at.is_some() =>
+        {
+            let expiry = chrono::DateTime::parse_from_rfc3339(asset.expires_at.as_deref().unwrap())
+                .map_err(|_| invalid_response())?;
+            let capture =
+                chrono::DateTime::parse_from_rfc3339(asset.capture_time.as_deref().unwrap())
+                    .map_err(|_| invalid_response())?;
+            if expiry <= capture || asset.sha256 != asset.sha256.to_ascii_lowercase() {
+                return Err(invalid_response());
+            }
+        }
         _ => return Err(invalid_response()),
     }
     check_expiry(asset)
@@ -666,6 +836,13 @@ fn check_expiry_value(expiry: Option<&str>) -> Result<(), CallToolResult> {
 }
 
 pub fn validate(request: &ImagesRequest) -> Result<(usize, usize), CallToolResult> {
+    if request
+        .camera_id
+        .as_deref()
+        .is_some_and(|camera| !valid_camera_id(camera))
+    {
+        return Err(tool_error("invalid_input", "camera_id is invalid."));
+    }
     let count = request.observation_ids.len() + request.asset_ids.len();
     let max_images = request.max_images.unwrap_or(4);
     let max_bytes_each = request.max_bytes_each.unwrap_or(4 * 1024 * 1024);
@@ -684,7 +861,7 @@ pub fn validate(request: &ImagesRequest) -> Result<(usize, usize), CallToolResul
     Ok((max_images, max_bytes_each))
 }
 
-fn valid_camera_id(id: &str) -> bool {
+pub(crate) fn valid_camera_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."
         && id != ".."
@@ -692,7 +869,7 @@ fn valid_camera_id(id: &str) -> bool {
         && !id.chars().any(char::is_control)
 }
 
-fn valid_asset_id(id: &str) -> bool {
+pub(crate) fn valid_asset_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 192
         && id
@@ -700,7 +877,10 @@ fn valid_asset_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
-async fn bounded_body(mut response: Response, max: usize) -> Result<Vec<u8>, CallToolResult> {
+pub(crate) async fn bounded_body(
+    mut response: Response,
+    max: usize,
+) -> Result<Vec<u8>, CallToolResult> {
     if response
         .content_length()
         .is_some_and(|length| length > max as u64)

@@ -14,13 +14,18 @@
 //! directory contains and where it came from.
 
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod download;
+use download::{
+    DEFAULT_DOWNLOAD_CHUNK_MIB, DEFAULT_DOWNLOAD_WORKERS, DownloadConfig, download_archive,
+};
 
 /// Version pins for the rtsp toolchain.
 ///
@@ -167,11 +172,17 @@ enum Cmd {
         #[arg(long)]
         force: bool,
         /// Build FFmpeg 7.1.5 from upstream source into target/vendor/
-        /// ffmpeg-static/ instead of using the prebuilt zip. Needs a POSIX
+        /// ffmpeg/ instead of using the prebuilt zip. Needs a POSIX
         /// build environment (sh, make, nasm; MSVC inside a Developer
         /// shell on Windows). Minutes, not seconds.
         #[arg(long)]
         from_source: bool,
+        /// Number of concurrent HTTP range workers.
+        #[arg(long, default_value_t = DEFAULT_DOWNLOAD_WORKERS)]
+        download_workers: usize,
+        /// Range chunk size in MiB.
+        #[arg(long, default_value_t = DEFAULT_DOWNLOAD_CHUNK_MIB)]
+        download_chunk_mib: u64,
     },
     /// Report which artifacts are cached vs. missing/stale.
     Status,
@@ -254,21 +265,6 @@ fn install_status(root: &Path, art: &Artifact) -> Status {
             && root.join(art.name).join(art.marker).exists()
     };
     if fresh { Status::Cached } else { Status::Stale }
-}
-
-fn download(url: &str) -> Result<Vec<u8>> {
-    let mut resp = ureq::get(url)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        bail!("GET {url} -> HTTP {}", resp.status());
-    }
-    let mut buf = Vec::new();
-    resp.body_mut()
-        .as_reader()
-        .read_to_end(&mut buf)
-        .context("reading response body")?;
-    Ok(buf)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -500,12 +496,19 @@ const SRC_CONFIGURE: &[&str] = &[
 /// `cargo xtask setup --force` is what puts the prebuilt zip back -- plain
 /// `setup` sees a valid cache and skips). Several minutes: configure's
 /// self-tests dominate, then make.
-fn build_from_source(root: &Path) -> Result<()> {
+fn build_from_source(root: &Path, config: DownloadConfig) -> Result<()> {
     require_build_tools()?;
 
     println!("downloading FFmpeg source (pinned {})", pins::SRC_URL);
-    let bytes = download(pins::SRC_URL)?;
-    verify_sha256(&bytes, pins::SRC_SHA)?;
+    let source_urls = vec![pins::SRC_URL.to_owned()];
+    let archive = download_archive(
+        root,
+        "ffmpeg-source",
+        &source_urls,
+        Some(pins::SRC_SHA),
+        config,
+    )?;
+    let bytes = fs::read(&archive).with_context(|| format!("reading {}", archive.display()))?;
 
     let src = root.join("ffmpeg-src");
     if src.exists() {
@@ -600,28 +603,10 @@ fn run(program: &str, args: &[&str], cwd: Option<&Path>, label: &str) -> Result<
     Ok(())
 }
 
-fn install(root: &Path, art: &Artifact) -> Result<()> {
-    // Try candidates in order (canonical, then mirrors); bytes are hash-
-    // verified so a mirror serving stale/corrupt data fails closed.
-    let mut bytes = Vec::new();
-    let mut last_err = None;
-    for url in &art.urls {
-        println!("downloading {} ...", url.rsplit('/').next().unwrap_or(""));
-        match download(url) {
-            Ok(b) => {
-                bytes = b;
-                last_err = None;
-                break;
-            }
-            Err(e) => {
-                println!("  fetch failed from {url}: {e}");
-                last_err = Some(e);
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        return Err(e);
-    }
+fn install(root: &Path, art: &Artifact, config: DownloadConfig) -> Result<()> {
+    println!("downloading {} ...", art.name);
+    let archive = download_archive(root, art.name, &art.urls, art.sha256.as_deref(), config)?;
+    let bytes = fs::read(&archive).with_context(|| format!("reading {}", archive.display()))?;
     let recorded_sha = match &art.sha256 {
         Some(pin) => {
             verify_sha256(&bytes, pin)?;
@@ -727,9 +712,15 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Setup { force, from_source } => {
+        Cmd::Setup {
+            force,
+            from_source,
+            download_workers,
+            download_chunk_mib,
+        } => {
+            let download_config = DownloadConfig::new(download_workers, download_chunk_mib, force)?;
             if from_source {
-                build_from_source(&root)?;
+                build_from_source(&root, download_config)?;
                 // libclang (or system llvm) is still needed for bindgen.
                 for art in artifacts() {
                     if art.name != "libclang" {
@@ -743,7 +734,7 @@ fn main() -> Result<()> {
                             "libclang: using system LLVM on {} (export LIBCLANG_PATH if not on default search path)",
                             platform()
                         ),
-                        _ => install(&root, &art)?,
+                        _ => install(&root, &art, download_config)?,
                     }
                 }
                 println!(
@@ -770,7 +761,7 @@ fn main() -> Result<()> {
                         };
                         println!("skipping {} on {}: {hint}", art.name, platform());
                     }
-                    _ => install(&root, &art)?,
+                    _ => install(&root, &art, download_config)?,
                 }
             }
             println!("\nsetup complete. cargo build --features rtsp should now work.");

@@ -1,4 +1,4 @@
-//! Single-instance guard (docs/resident-ingest.md §1) and the stale-lock
+//! Single-instance guard (design/resident-ingest.md §1) and the stale-lock
 //! takeover that lets a service manager restart a killed daemon (§8).
 //!
 //! Two writers on one WAL database is the failure that corrupts data quietly,

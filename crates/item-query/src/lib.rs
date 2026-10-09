@@ -5,6 +5,7 @@
 
 pub mod affordance;
 pub mod containment;
+pub mod spatial;
 pub mod vlm;
 
 use crate::affordance::Priors;

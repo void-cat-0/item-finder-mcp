@@ -1,5 +1,5 @@
 //! `Supervisor`: one OS thread per camera, plus the graceful-stop flag
-//! (docs/resident-ingest.md §2/§3).
+//! (design/resident-ingest.md §2/§3).
 //!
 //! It does exactly three things: start threads, watch the stop flag, and reopen
 //! a camera's source after a backoff. A panicking or erroring camera never
@@ -28,7 +28,7 @@ use crate::source::SourceError;
 
 /// Reconnect backoff: doubles from the historical fixed 2s up to a 60s
 /// ceiling, so an unplugged camera costs a handful of log lines per hour
-/// instead of one every two seconds (docs/resident-ingest.md §10, P2).
+/// instead of one every two seconds (design/resident-ingest.md §10, P2).
 #[derive(Debug, Clone)]
 pub struct Backoff {
     current: Duration,

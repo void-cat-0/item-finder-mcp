@@ -1,213 +1,124 @@
-# 检测流程与预期结果
+# 检测、观测与图像证据的数据流
 
-> 本文对照代码描述检测闭环的数据流、每一步在 SQLite 里造成的精确变化，以及这些
-> 变化如何映射到 Web UI 上看到的卡片。供跑流程前预览预期、跑流程后核对结果。
-> 文中所有常数均以代码为准：`store.rs`（去重窗口）、`main.rs` rtsp_pass（NMS
-> 0.45 / 默认路径）、`index.html`（刷新与 limit）。
+本文按源码中的实际路径解释数据含义。检测框、历史观测、原始图像、烧框图片和调用方标注是不同的数据，不能互相替代，也不构成实时在场保证。
 
-## 0. 管线总览
+相关入口：[开始使用](getting-started.md) · [运行与维护](operations.md) · [MCP 使用](mcp-usage.md) · [已知限制](known-limitations.md)。VLM grounding 配置见 [VLM sidecar](vlm-sidecar.md)。
 
-```
-RTSP (1280x720 @25fps)
-  → RtspSource 解码           每帧都解（25/s）
-  → detect-fps 节流           只取 ~1/s 帧送检测（其余 decode-only 丢弃）
-  → YoloDetector (yolov8n)    每 280ms 一次推理 → raw Vec<Detection>（可能 0~N 个框）
-  → NMS (IoU>0.45 去重)       同 label 重叠框合并
-  → zone_for_point            框【中心点】落在哪个区域矩形 → zone 名，否则 "frame"
-  → record_sighting           合并进活跃 observation 或 INSERT 新行，返回 (id, is_new)
-  → is_new 时                 标注帧 JPEG 写 data/snapshots/{id}.jpg，路径回填该行
-                              （烧入：本帧全部 NMS 存活框按 label 着色 + 灰虚线区域；
-                               本行的框加粗 + 白外圈，每框带 "label conf" 色块标签）
-```
+## 1. 从原始 frame 到 Observation
 
-三个进程/端口相互独立：`item-ingest --rtsp`（写库）、`item-ingest --preview`
-（8477，实时 MJPEG，不碰库）、`item-web`（8478，只读库）。
+RTSP 与本地摄像头共用 `CameraRunner` / supervisor，区别主要在 `FrameSource` 和构建 feature：RTSP 使用 `rtsp`，本地摄像头使用 `camera`。
 
-`--webcam <n>`（feature `camera`，nokhwa/DirectShow）走**同一条**泵帧-检测-落库
-循环（`main.rs::camera_pump`），只是帧源换成内置/USB 摄像头：无 RTSP 的
-decode-only 概念（每次 `next_frame` 阻塞等相机，帧率 ~2-30fps 由相机决定），
-无 config 时 zone 恒为 `frame`，且不需要 FFmpeg/libclang 那套本机设置。
-
-## 1. 数据库结构（data/items.db，WAL 模式）
-
-```sql
-CREATE TABLE observations (
-    id              INTEGER PRIMARY KEY,   -- 自增；也是快照文件名
-    camera_id       TEXT NOT NULL,         -- 命令行 --camera-id / config
-    zone            TEXT NOT NULL,         -- 区域名，无 config 时恒为 'frame'
-    label           TEXT NOT NULL,         -- COCO 80 类英文名
-    first_seen      TEXT NOT NULL,         -- RFC3339 UTC
-    last_seen       TEXT NOT NULL,         -- RFC3339 UTC
-    hit_count       INTEGER NOT NULL,      -- 合并进该行的检测帧次数
-    sample_snapshot TEXT                   -- 出生帧 JPEG 路径；或 frigate:// 引用
-);
-CREATE TABLE regions (id, camera_id, name, x0, y0, x1, y1, UNIQUE(camera_id,name));
+```text
+FrameSource 返回 RGB frame + camera_id / captured_at / 宽高
+  ├─ daemon 启用原始资产服务时：更新该 camera 的有界最新帧缓存
+  └─ detect_fps 节流
+       → Detector 返回 label / confidence / 像素 bbox
+       → 可选 relative-depth provider，估计该图中检测框的相对深度
+       → 裁剪框到图像范围，丢弃非有限或零面积框
+       → 同 label NMS（IoU > 0.45 的低优先级框被抑制）
+       → 框中心点映射到 regions，未命中则 zone="frame"
+       → 合并或新建 Observation，同时维护几何样本及可用深度
+       → 按模式保存烧框图；daemon 可为新 Observation 发布 raw JPEG
+       → runner 更新 lifecycle tracker，保存事件及事件几何证据
 ```
 
-要点：**没有逐帧事件表**。库里的每一行都是一个"物品在某区域的停留时段"
-（observation），行数远小于检测次数——这是"记忆"与"日志"的区别。
+- `detect_fps` 是检测节流，不是录制帧率或实际吞吐保证。未送检测的帧不产生检测观测；daemon 缓存可在检测节流前更新，但不是全帧录像。
+- 每个 runner 同步进行取帧、推理和持久化。慢推理或 HTTP 请求在途时，该 runner 不继续消费新帧，帧源缓冲可能导致延迟。
+- 默认 YOLO/null 为 1.0 次/秒，VLM 为 0.2 次/秒；真实频率还受推理和 I/O 耗时限制。
+- 检测失败时跳过该帧，由 supervisor 退避重试，延迟从 2 秒指数增长到最多 60 秒；不把失败伪装成“图中没有物品”。数据库等不可恢复错误则可能停止该 camera。
 
-## 2. 合并规则与逐帧演变（预期输出的核心）
+## 2. Detector、NMS 与 regions
 
-同 `(camera_id, zone, label)` 三元组，若 `last_seen` 距新检测 ≤ **5 分钟**
-（`DEFAULT_DEDUP_WINDOW = 300s`）则 UPDATE 否则 INSERT。以典型桌面场景
-（detect-fps=1，人一直在画面里）推演 `person` 的变化：
-
-| 时刻 | 事件 | SQL 效果 | 行状态 |
-|---|---|---|---|
-| 09:00:00 | 首次检出 person@desk | INSERT id=7 | hits=1, first=last=09:00:00, 写 snapshots/7.jpg |
-| 09:00:01 | 再次检出 | UPDATE id=7 | hits=2, last_seen 前移；**不写快照** |
-| …每秒重复 | | UPDATE id=7 | hits 线性涨（≈60/分钟） |
-| 09:40:00 | 人已出画 5 分钟以上 | — | id=7 冻结在最后一次命中 |
-| 09:41:00 | 人重新入画 | **INSERT id=12** | 新行新快照；id=7 成为历史 |
-
-由这张表可推出的预期行为，也是核对清单：
-
-1. **hit_count ≈ 检测次数**：静态场景跑 10 分钟，主要物体的 hits 会到几百。
-   数值本身就是"检测有多稳"的读数。
-2. **离开又回来 = 新 observation**：5 分钟是硬分界，回来会拿到新 id、新出生照。
-   所以 UI 上同一物体可能出现多张卡（不同时段），这是特性不是重复 bug。
-3. **快照每行只有一张，内容 = 该行诞生那一刻的画面（带烧入标注）**，此后永不更新。
-   对着 last_seen 很新但图是"刚出现时"的情况不必惊讶。标注画的是**出生帧全部**
-   存活检测框（细线 + 小色块标签；同 label 多框都会画出来——这正是 hits 超速增长
-   的视觉解释），外加该相机所有配置区域的灰色虚线矩形；**唯独本行的那个框**被
-   高亮（加粗描边 + 白色外圈 + 大号 "label conf" 色块）。高亮是逐行渲染的——
-   同帧诞生 5 行就渲染 5 份、各亮各的框，所以**同帧的快照文件也互不相同**
-   （底图相同、唯一的粗白圈不同）。实现在 `item-ingest/src/annotate.rs`。
-4. **zone 由中心点单点判定**：一个框永远只属于一个 zone。人从 desk 区走到
-   upper 区会分裂成两条 observation（各自计数、各自快照）。
-5. **重叠抑制**：同一物体的多个冗余框在 NMS（同 label IoU>0.45）后只记一次，
-   一次"椅子被框两遍"不会让 hits 翻倍。
-6. `conf` 下限由检测器把守（默认 0.3，`--conf` 可调），进入落库环节的还有
-   低分候选，所以偶发误报（如昨天的 chair→bed）会真实入库。
-
-## 3. 冷启动第一分钟会看到什么
-
-全新库 + `--camera-id living` 无 config（最常见跑法）：
-
-- 前几秒：RTSP 握手 + ort 加载模型（首次推理稍慢，日志会刷 ort 的
-  Initializer 警告——是 onnxruntime 的碎碎念，无害）。
-- 第一帧检测后：`item-ingest: detections ingested frames=N recorded=M`
-  开始按秒出现；`data/snapshots/` 出现 `1.jpg、2.jpg…`（编号=行 id）。
-- 库里第一分钟大致长这样（zone 全是 frame）：
-
-```
- id | camera | zone  | label        | first            | last             | hits
-----+--------+-------+--------------+------------------+------------------+-----
-  1 | living | frame | chair        | 18:00:03 | 18:00:58 | 45
-  2 | living | frame | person       | 18:00:03 | 18:00:58 | 45
-  3 | living | frame | dining table | 18:00:05 | 18:00:58 | 40
-  4 | living | frame | cup          | 18:00:07 | 18:00:58 | 38
-  5 | living | frame | tv           | 18:00:09 | 18:00:20 | 11     ← 被遮挡后停止增长但行还"活着"
-```
-
-（参照：昨天真机 90 秒 @2fps 产出 8 行，person×20、chair×64，数量级以此为准；
-`--detect-fps 1` 时 hits 增速约为其一半。）
-
-- **停止循环后**：行不再更新但也不删除——last_seen 从此就是"最后一次见到"。
-  （这正是常驻化的理由："停止"在常驻模式下不再是常态，见
-  [resident-ingest.md](resident-ingest.md)。）
-## 4. Web UI 对照（8478 端口）
-
-### 4.1 一张卡片 = 一行 observation
-
-```
-┌────────────────────────┐
-│   snapshots/{id}.jpg    │  ← sample_snapshot 解析出的文件（框与区域线已烧入像素）；文件不存在/是
-├────────────────────────┤    frigate:// 时显示 "no snapshot" 占位
-│ person                  │  ← label
-│ (desk)(living)   ×20    │  ← zone 芯片 · camera 芯片 · hit_count
-│ last seen 5 min ago     │  ← last_seen（相对时间，随刷新滚动）
-│  · first 42 min ago     │  ← first_seen
-└────────────────────────┘
-```
-
-排序：`last_seen` 从新到旧；请求 limit=200（后端钳制 1..500）。每 10 秒整页
-自动刷新，循环在跑时新卡会自己冒出来。
-
-字段映射一览：
-
-| UI 元素 | 来源 | 逻辑位置 |
+| 后端 | 输入与输出 | 使用边界 |
 |---|---|---|
-| 标题 | `label` | 直读 |
-| 两枚芯片 | `zone`、`camera_id` | 直读 |
-| ×N | `hit_count` | 直读 |
-| 时间两行 | `last_seen`/`first_seen` | 前端相对时间格式化 |
-| 缩略图/放大 | `sample_snapshot` | `/api/observation/{id}/snapshot`：相对路径按 web 进程 cwd 解析，先 `is_file()` 才置 `has_snapshot=true` |
-| 底部 "N observations" | 行数 | `list` 结果长度 |
+| YOLO（`yolo` feature） | 本地 ONNX 推理，默认 COCO 80 类、`--conf` 默认 0.3 | 词表受模型限制，分数不是物品身份 |
+| VLM（`vlm` feature） | JPEG 发给 OpenAI-compatible grounding endpoint，回复转换为像素框 | 开放词表；`--targets` 是提示词约束，不是结果的硬过滤 |
+| NullDetector | 返回空检测集合 | 无真实检测后端时用于管线；空集合不证明真实场景为空 |
 
-### 4.2 搜索框与 Ask
+NMS 按分数从高到低，只抑制**同 label**且 IoU 超阈值的框。它既不是实体跟踪，也不会将不同 label 的框合并。
 
-- **搜索框**：服务端 `label LIKE '%词%'` 子串过滤（大小写不敏感），防抖 250ms。
-  输入 `cup` 只剩杯子卡；输入无匹配词 → "No objects match ..."（与冷启动空库的
-  "还没有数据"提示刻意区分）。
-- **Ask**：`/api/ask?q=`。当前无 VLM 侧车时返回 `mode:"log"`——前端展示为
-  "log match for ...: label @ zone (time)"，即把命中 observation 念出来。
-  注意它的取词是个小停用词表（滤掉 where/is/my/the...取第一个实词），
-  所以 "where did I put my **remote**" 实际搜 `remote`；命中 0 条也是合法回答
-  （"nothing recorded that matches"）。设了 `ITEM_VLM_BASE_URL`+`ITEM_VLM_MODEL`
-  后同一入口变成模型成句回答。
+regions 是按 camera 配置、写入数据库的像素矩形。zone 使用框中心点单点判定，取第一个包含它的 region；无命中返回 `frame`。重叠区域不提供多 zone 归属，改变图像分辨率后应检查 region 坐标。区域归属也不等于三维容纳关系。
 
-### 4.3 与 preview（8477）的分工
+## 3. Observation 的去重与计数
 
-| | 8477 `/preview` | 8478 web UI |
+`Observation` 是持久化的历史目击记录，主要字段为 `camera_id`、`zone`、`label`、`first_seen`、`last_seen`、`hit_count` 与可选 `sample_snapshot`。
+
+- 去重键是 `(camera_id, zone, label)`，默认窗口 300 秒。新目击与已有记录的时间跨度在窗口内时合并，否则新建记录。
+- 对正常按时间到达的目击，可理解为距上次目击不超过 5 分钟继续合并。乱序输入按时间跨度判断；`first_seen` 取更早时间，`last_seen` 取更晚时间。
+- 每个 NMS 存活框形成一次 sighting，合并或插入都会计入返回的 `recorded` 数量；它不是“新增行数”。`hit_count` 也不是严格的帧数。
+- 一帧中两个不重叠的同类物品，若 camera/zone/label 相同，可能合并到同一 Observation 并增加两次 hits。不能从 hits 或 observation_count 推算物品实例数量。
+- 跨 zone 会形成不同记录；停止检测只会停止更新，不会即时删除历史记录。超过窗口再次命中才会新开记录。
+
+例如：09:00 首次见到 `cup@desk` 新建一行；09:01 再次命中更新同一行；09:10 才再次命中则通常新建一行。这个例子不提供同一只杯子的跨帧身份保证。
+
+## 4. Geometry、depth 与 lifecycle
+
+### Geometry：框会持久化，但不是所有逐帧检测的日志
+
+`observation_geometry` 保存有界 `first` / `last` 样本，包括采集时间、bbox、图像宽高、zone、source、confidence 和可选 `snapshot_ref`。更早输入可更新 `first`，更晚输入可更新 `last`；事件另行冻结几何副本，后续更新 `last` 不改变事件证据。
+
+因此不能再说“框不落库”，也不能说“每一帧的框都永久保留”。几何样本、图像文件和 raw asset 是独立对象；有 bbox 或 `snapshot_ref` 不保证图片仍存在，也不保证引用对应 MCP raw asset。
+
+### Depth：独立可选证据，不是米制距离
+
+`relative-depth` 是独立 feature，运行时 `depth_provider` 默认 `none`，可选择 `relative-vlm`。它可与 YOLO 或 VLM grounding 配合，不会因为启用 `vlm` 自动启用。
+
+provider 给出 `nearer` / `middle` / `farther` / `unknown`、可选 0–1 序数分值及质量，持久化时关联对应几何样本，并保存 provider/model/frame/response/prompt 等来源信息。这里的分值不是概率或米数；没有标定、metric depth、三维坐标或深度图。流式估计失败保留检测结果，只缺少深度证据。
+
+### Lifecycle：检测时间线，不是物品消失的确定解释
+
+runner 的 tracker 按 camera/zone/label 维护当前跟踪记录。首次跟踪或 Observation ID 变化生成 `appeared`；成功检测步骤后，未命中时间超过 `max(30 秒, 3 × 检测间隔)` 可生成 `disappeared`，reason 为 `missed_gap`。
+
+- 消失事件的 `occurred_at` 是最后命中时间，`noticed_at` 是后来发现间隔已超过阈值的时间。
+- 正常结束会关闭 tracker，reason 为 `shutdown`；记录切换可能为 `row_changed`。不能将这些原因都解释为“物品被移走”。
+- 数据库事件包含 session/source/reason，并冻结关联几何；JSONL 是另一个运维时间线输出。写入证据失败会告警，不能假设时间线永远完整。
+- 事件间隔与 Observation 的 300 秒去重窗口不同：同一 Observation 可以在不同 tracker 生命周期中再次出现，`appeared` 不一定表示新建数据库行。
+
+## 5. 各运行模式的实际差异
+
+| 路径 | 检测与持久化行为 |
+|---|---|
+| `--detect <JPEG/PNG>` | 读单图、运行 detector、NMS、打印结果；可用 `--out` 写烧框副本、`--depth-out` 写相对深度 JSON。不打开观测数据库，不创建 Observation 或 lifecycle |
+| `--rtsp` / `--webcam` | 共用 runner/supervisor，写 Observation、几何与事件；受 `--frames` 限制。此 CLI 路径不配置 daemon raw asset registry |
+| `--daemon --config ...` | 常驻管理配置中的 enabled cameras，提供资产、最新帧缓存及维护能力；不是用 CLI `--frames` 结束的单路任务 |
+| Frigate webhook | 上游已完成检测，本项目不再次运行本地 Detector/NMS；按同样时间窗口去重，有 bbox 时保存几何，记录 `observed` 事件。缺 bbox/宽高时证据能力受限，不推断本地 `disappeared` |
+| `--preview` | RTSP 预览组件另取流，提供 `/preview`、`/preview.jpg`、`/preview.mjpg`；不执行检测。但宿主 ingest 仍会打开数据库、可初始化 regions 和提供 webhook，不能称整个 preview 进程“完全不碰库” |
+
+### 烧框快照模式：以实际写入为准
+
+| `--snapshots` | 当前本地检测路径的行为 |
+|---|---|
+| `off` | 不写烧框快照；不关闭 Observation/geometry，daemon raw 发布也不受此项关闭 |
+| `first`（默认） | 新 Observation 写 `{id}.jpg`，并回填 `sample_snapshot`；以后命中不刷新这张代表图 |
+| `events` | 当前实现同样在新 Observation 写 `{id}.jpg`，但不回填 `sample_snapshot`；runner 保存事件元数据/冻结几何，不另外写事件 JPEG |
+| `detections` | 每个存活 sighting 写 `{id}-g{geometry_id}.jpg`；不回填 `sample_snapshot`，也不自动建立几何到该文件的引用 |
+
+虽然配置注释将 `events` / `detections` 描述为逐级增加事件图，当前实现不能据此承诺事件图片或可查询的全帧档案。`last` 的 geometry ID 可复用，`detections` 文件名也可能重复覆盖；这些文件不等于完整录像。
+
+烧框图包含本帧存活检测框、区域线和逐 sighting 高亮。同帧新建多个 Observation 时，可以生成底图相同而高亮不同的 JPEG。
+
+## 6. Raw、annotated 与 caller annotation
+
+| 数据 | 内容与寿命 | 不代表什么 |
 |---|---|---|
-| 回答的问题 | "现在镜头前是什么"（实况 MJPEG，不落库） | "什么东西在哪里、最后一次见到是啥时候"（查账本） |
-| 数据依赖 | 无（直连摄像头） | items.db + snapshots/ |
-| 是否写库 | 否 | 只读（`SQLITE_OPEN_READ_ONLY`） |
+| Observation raw asset | daemon 在新建 Observation 时，从未画框 RGB 编码 JPEG；独立资产身份/哈希，受 Observation 和 retention 生命周期约束 | 不一定是最新命中图片；不是 `sample_snapshot` |
+| frozen camera frame | 从有界最新帧缓存冻结的不可变未画框 JPEG，携带 camera/capture/expiry；读取同一 asset 不刷新其采集时间或 TTL | 不创建 Observation，历史冻结图不保证当前在场 |
+| annotated snapshot | 检测框和区域线烧入像素的展示图片；是否有图、如何命名由快照模式决定 | 不可作为 MCP raw 图片的回退来源 |
+| caller annotation | host 中调用方模型对特定 raw 图片提交的结构化标注，有 producer、版本和独立保留证据 | 不是 daemon detector 的目击，不自动加入已有寻物 label 查询 |
 
-## 5. 已知的理论↔实际偏差（核对时别当 bug）
+caller annotation 默认禁止写入，启用流程见 [MCP 使用](mcp-usage.md)。一次标注可含 0–128 个物体，使用单图内 `object_id`，修订不会提供跨帧/跨 camera 身份。保留的 annotation evidence 与原 frame asset TTL 独立，不会续期原资产；raw 图片也不会因此被烧框修改。
 
-- **误分类会入库**：yolov8n 把办公椅认成 `bed` 已实际发生（COCO 类粗）。
-  同类混淆还有 cushion/chair、book/laptop 等。计数照常合并。COCO 之外
-  的物品（keys/remote 等）走 `--detector vlm`（见第 7 节）。
-- **空场也有货**：椅子一直空着坐，chair observation 会一直活着且 hits 猛涨——
-  observation 记录的是"物体在场"，不是"物体被使用"。
-- **快照目录与 db 的相对性**：`sample_snapshot` 存的是相对路径，换目录启动
-  web 会导致 `has_snapshot=false`（图不出来，其余功能正常）。同一仓库根目录
-  下启动即无此问题。
-- **标注是烧进像素的，UI 无法关框/换框**：框数据不落库（设计上不存逐帧检测），
-  所以老快照（该特性之前写的）不会有框，`frigate://` 引用图也不归我们画。
-  同一帧里诞生的多个 observation 底图相同、但**各高亮自己的框，文件互不相同**
-  （逐行渲染所致，别当重复 bug）。
-- **时间全为 UTC**：UI 里浏览器会转成本地时区显示（`toLocaleString`/相对
-  时间），db 原文是 `+00:00`，比对时差 8 小时（东八区）属正常。
-- **一次检测可产多行**：一帧里 N 个框各归各的 zone/label，`recorded=M` 打印
-  的是这批新增记录数，不是行数（合并行也算 recorded）。
+### 坐标不能混用
 
-## 6. 快速自检命令
+- 检测与持久化 geometry：像素 `xyxy = [xmin, ymin, xmax, ymax]`，原点为图像左上。
+- VLM sidecar 的 `bbox_2d`：按选定 `norm1000` 或 `pixel` 解释后转换为像素 xyxy，详见 sidecar 文档。
+- caller annotation：`coordinate_system="normalized_xywh"`，`bbox=[x, y, width, height]`，在 0–1 范围内；宽高必须为正，且整个框在图内。
+- 若从像素 xyxy 转换：`[xmin/W, ymin/H, (xmax-xmin)/W, (ymax-ymin)/H]`。不能直接复制 detector bbox，也不能将 0–1000 数值当作 0–1 标注坐标。
 
-```sh
-# 行数与内容（等价于 UI 读的东西）
-cargo run -p item-query -- --db data/items.db log
+## 7. Web 和查询应如何解读
 
-# 快照是否与新增行同步增长
-ls data/snapshots | wc -l
+`item-web` 是只读查询/图片展示端。Observation 卡片展示 label、camera、zone、hits 和 first/last 时间；图片取自可解析且存在的 `sample_snapshot`。默认 `first` 图通常比 `last_seen` 旧，这不是实时画面。
 
-# 直接戳 API
-curl "http://127.0.0.1:8478/api/observations?limit=5"
-curl -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8478/api/observation/1/snapshot
-```
+空间/容纳候选的证据视图可展示几何、事件与深度来源；几何图片接口读取样本自己的 `snapshot_ref`，可能没有图片，不能据此回退到其他 frame。候选是解释性假设，不是直接目击或确定当前位置。
 
-## 7. VLM grounding 检测器（`--detector vlm`，`--features vlm`）
-
-`--detector vlm` 把第 1 节管线里的 YoloDetector 换成 `VlmGroundDetector`：
-帧 JPEG+base64 后发给 OpenAI 兼容多模态 sidecar（`ITEM_VLM_BASE_URL`/`ITEM_VLM_MODEL`，
-与 4.2 的 ask bar 共用），要求回 JSON 数组 `{"label","bbox_2d":[x1,y1,x2,y2]}`
-（0-1000 归一化；任一坐标 >1000 自动按像素解释）。**管线其余环节零变化**：
-NMS(0.45) → zone_for_point → 5 分钟去重 → 快照烧框高亮，WebUI 照常读。
-区别只在 label 词表：`--targets` 自定义（默认家居 12 类，空串=开放列举），
-不再限 COCO 80 类。
-
-行为差异核对时留意：
-
-- **速度**：一帧一次 HTTP 往返（本地 3B CPU 数秒~十几秒），`--detect-fps`
-  未显式给时自动降到 0.2；检测在途时不读帧，RTSP 可能积压。
-- **sidecar 容错**：请求失败/超时只 warn+跳帧（2s 后再试），**不会**杀
-  camera_pump——YOLO 路径的瞬时推理错误现在也走这条容错路径。
-- **置信度**：VLM 无标定分数，回 `score` 字段就用（clamp 0..1），否则 1.0。
-- **快照语义不变**：每新行一张、高亮本行框；`--detect <img> --out out.png`
-  可在无摄像头时单帧出图（第一个框高亮）。
-
-sidecar 搭建（llama.cpp + Qwen2.5-VL GGUF，走 hf-mirror）：
-[vlm-sidecar.md](vlm-sidecar.md)。
+检索不到记录、没有图片、raw 已过期或缺少深度，分别表示不同的证据缺口。Web 刷新、卡片数量和资产列表都不证明“所有 frame 已保留”；同类物品合并、标注与现有寻物查询的边界见 [已知限制](known-limitations.md)。

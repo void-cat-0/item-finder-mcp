@@ -33,6 +33,28 @@ pub enum StoreError {
     SchemaVersion(i64),
     #[error("invalid persistence input: {0}")]
     InvalidInput(String),
+    #[error("annotation idempotency conflict")]
+    AnnotationIdempotencyConflict,
+    #[error("annotation revision conflict; current revision is {current_revision}")]
+    AnnotationRevisionConflict { current_revision: u32 },
+    #[error("annotation not found")]
+    AnnotationNotFound,
+    #[error("annotation expired")]
+    AnnotationExpired,
+    #[error("annotation quota exceeded: {0}")]
+    AnnotationQuota(String),
+    #[error("annotation schema unavailable")]
+    AnnotationSchemaUnavailable,
+    #[error("read deadline exceeded")]
+    ReadTimeout,
+    #[error("read cancelled")]
+    ReadCancelled,
+    #[error("necessary evidence exceeds the payload budget")]
+    PayloadTooLarge,
+    #[error("observation not found")]
+    ObservationNotFound,
+    #[error("observation camera mismatch")]
+    CameraMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -115,7 +137,7 @@ pub struct RecordedItemsPage {
 }
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Store {
@@ -221,7 +243,7 @@ impl Store {
 
     /// Fold the WAL back into the main database file. Called on daemon
     /// shutdown so a stopped process leaves one compact file
-    /// (docs/resident-ingest.md §3/§7). `wal_checkpoint` returns a row, so
+    /// (design/resident-ingest.md §3/§7). `wal_checkpoint` returns a row, so
     /// `execute_batch` cannot be used here.
     ///
     /// The `busy` column is the whole point of reading the row: a `1` there
@@ -407,7 +429,7 @@ impl Store {
     /// reaches within `window` of `seen_at`, otherwise insert a fresh row.
     /// Returns (row id, is_new, hit_count): the caller writes a snapshot
     /// exactly when is_new, and uses `hit_count` for the disappearance events
-    /// of docs/resident-ingest.md §6, which report how many times the object
+    /// of design/resident-ingest.md §6, which report how many times the object
     /// was seen before it went.
     ///
     /// Two properties the merge has to keep, because `[first_seen, last_seen]`
@@ -1207,7 +1229,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    // ---- retention (docs/resident-ingest.md §7) ---------------------------
+    // ---- retention (design/resident-ingest.md §7) ---------------------------
 
     /// Delete every observation last seen before `cutoff`, returning the ids
     /// that went away. The caller deletes those snapshots **after** this

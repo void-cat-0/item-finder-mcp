@@ -1,5 +1,5 @@
 //! Bounded growth: the retention window, snapshot cleanup and orphan
-//! reconciliation (docs/resident-ingest.md §7).
+//! reconciliation (design/resident-ingest.md §7).
 //!
 //! Three invariants, in the order they matter:
 //!

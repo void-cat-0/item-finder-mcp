@@ -1,5 +1,5 @@
 //! Runtime task descriptions: the pure-data layer that separates "what to run"
-//! from "how to run it" (docs/resident-ingest.md §2).
+//! from "how to run it" (design/resident-ingest.md §2).
 //!
 //! Nothing here touches the store or spawns threads. The only side-effecting
 //! entry points are [`build_source`] / [`build_detector`], and their
@@ -32,7 +32,7 @@ pub enum SourceSpec {
     /// Local/USB camera by index (feature `camera`). The index is **not**
     /// portable: DirectShow / V4L2 / AVFoundation enumerate different devices,
     /// so it must never be treated as a portable config value
-    /// (docs/resident-ingest.md §9).
+    /// (design/resident-ingest.md §9).
     Webcam { index: u32 },
 }
 
@@ -127,7 +127,7 @@ pub struct CameraTask {
     /// Daemon-owned raw asset registry; `None` keeps standalone/test paths unchanged.
     pub raw_assets: Option<crate::assets::AssetStore>,
     /// Where this camera's appeared/disappeared timeline is appended, or `None`
-    /// to run without one (docs/resident-ingest.md §6). A file rather than a
+    /// to run without one (design/resident-ingest.md §6). A file rather than a
     /// handle so the daemon can hand the same path to every camera.
     pub events_path: Option<PathBuf>,
     /// Stop after this many frames; 0 = run until stopped.

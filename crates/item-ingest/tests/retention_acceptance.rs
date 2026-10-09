@@ -1,4 +1,4 @@
-//! P3's acceptance criterion, as a test (docs/resident-ingest.md §10):
+//! P3's acceptance criterion, as a test (design/resident-ingest.md §10):
 //!
 //! > 造 1 万行 + 1 万张图，跑清理后行数与文件数同时下降且无"指向已删文件的
 //! > sample_snapshot"；Windows 下遇到被占用文件不中断清理
