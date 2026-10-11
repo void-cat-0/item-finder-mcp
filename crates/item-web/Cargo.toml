@@ -2,6 +2,7 @@
 name = "item-web"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 item-core.workspace = true

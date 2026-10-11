@@ -5,6 +5,7 @@ members = ["crates/core", "crates/item-ingest", "crates/item-query", "crates/xta
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 item-core = { path = "crates/core" }

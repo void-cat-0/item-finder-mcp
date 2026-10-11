@@ -16,8 +16,6 @@
 | 配置 systemd、launchd 或 Windows 任务计划程序 | [服务部署模板](deploy/README.md) |
 | 了解同类物品、标注检索和实例身份限制 | [已知限制](docs/known-limitations.md) |
 
-使用说明均随仓库分发，不需要本机设计资料。`design/` 是被忽略的本地设计目录，不属于安装或运行前提。
-
 ## 工作方式
 
 ```text
@@ -112,3 +110,7 @@ cargo +stable clippy --workspace --all-targets -- -D warnings
 ```
 
 `cargo test` 不保证普通可执行文件已刷新；修改后部署前应显式 `cargo build`。Windows 上不要覆盖运行中被锁定的 exe，可用独立构建目录再安排升级。`cargo clean` 会删除 `target/` 内的 RTSP 工具链缓存。离线 maintenance 会删除数据并 VACUUM，务必先阅读 [运维指南](docs/operations.md)，不要在 daemon 活跃时执行。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。第三方依赖、模型权重及可选原生组件仍遵循各自的许可证；本项目的 MIT 许可不替代它们的许可与再分发要求。

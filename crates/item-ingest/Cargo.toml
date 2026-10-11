@@ -2,6 +2,7 @@
 name = "item-ingest"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 item-core.workspace = true
