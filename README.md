@@ -1,4 +1,4 @@
-# Item Finders MCP
+# Item Finder MCP
 
 基于摄像头和历史证据的物品记忆系统。采集端将“某个标签在某台摄像头的某个区域被看到过”保存为 SQLite 记录；MCP、命令行和 Web 界面读取同一数据集，帮助回答“最后在哪里看到它”，并按需提供原图、几何证据和保守的遮挡/容纳候选。
 
@@ -65,10 +65,10 @@ cargo +stable build -p item-mcp
 {
   "mcp": {
     "servers": {
-      "item-finders-mcp": {
+      "item-finder-mcp": {
         "type": "stdio",
-        "command": "C:/projects/item-finders-mcp/target/debug/item-mcp.exe",
-        "args": ["--stdio", "--db", "C:/projects/item-finders-mcp/target/quickstart/items.db"]
+        "command": "C:/projects/item-finder-mcp/target/debug/item-mcp.exe",
+        "args": ["--stdio", "--db", "C:/projects/item-finder-mcp/target/quickstart/items.db"]
       }
     }
   }

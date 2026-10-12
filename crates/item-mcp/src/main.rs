@@ -3,7 +3,7 @@ use item_mcp::ItemMcpServer;
 use rmcp::ServiceExt;
 
 #[derive(Parser)]
-#[command(name = "item-mcp", version, about = "Item Finders MCP stdio server")]
+#[command(name = "item-mcp", version, about = "Item Finder MCP stdio server")]
 struct Args {
     /// Use stdio transport (also the default).
     #[arg(long)]

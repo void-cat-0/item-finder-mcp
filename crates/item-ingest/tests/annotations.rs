@@ -11,7 +11,7 @@ use item_core::{
 };
 use item_ingest::{
     annotations::{self, AnnotationRuntime},
-    assets::AssetStore,
+    assets::{AssetFailure, AssetStore},
     config::{CliOverrides, EnvOverrides, RuntimeConfig},
 };
 use serde_json::{Value, json};
@@ -29,6 +29,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_ttl(Duration::from_secs(60))
+    }
+    fn new_with_ttl(camera_ttl: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Mutex::new(
             Store::open(dir.path().join("db.sqlite")).unwrap(),
@@ -38,7 +41,7 @@ impl Fixture {
             8 * 1024 * 1024,
             Some("read-secret".into()),
             db.clone(),
-            Duration::from_millis(250),
+            camera_ttl,
         )
         .unwrap();
         let now = Utc::now();
@@ -51,15 +54,15 @@ impl Fixture {
         let observed = assets
             .publish_rgb(&owner, now, &[90; 4 * 4 * 3], 4, 4)
             .unwrap();
-        let camera = assets
-            .publish_camera_rgb("laptop", now, &[170; 4 * 4 * 3], 4, 4)
-            .unwrap();
         let mut settings =
             RuntimeConfig::resolve(None, &CliOverrides::default(), &EnvOverrides::default())
                 .unwrap();
         settings.annotations_enabled = true;
         settings.annotation_token = Some("write-secret".into());
         let runtime = AnnotationRuntime::new(assets.clone(), &settings).unwrap();
+        let camera = assets
+            .publish_camera_rgb("laptop", Utc::now(), &[170; 4 * 4 * 3], 4, 4)
+            .unwrap();
         Self {
             _dir: dir,
             assets,
@@ -242,13 +245,38 @@ async fn dual_sources_auth_guards_duplicate_keys_and_atomic_validation() {
 }
 #[tokio::test]
 async fn expired_source_replay_revision_concurrency_and_restart_keep_evidence() {
-    let f = Fixture::new();
+    let f = Fixture::new_with_ttl(Duration::from_secs(10));
     let body = f.payload(&f.camera, "stable");
     let (s, r) = f.post(&body).await;
     assert_eq!(s, StatusCode::CREATED);
     let receipt: AnnotationReceipt = serde_json::from_value(r.clone()).unwrap();
-    tokio::time::sleep(Duration::from_millis(260)).await;
-    f.assets.purge_expired_camera_assets().unwrap();
+    let expires_at = chrono::DateTime::parse_from_rfc3339(f.camera.expires_at.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
+    let wait = (expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        .saturating_add(Duration::from_millis(100));
+    tokio::time::sleep(wait).await;
+    assert_eq!(
+        f.assets.metadata(&f.camera.asset_id),
+        Err(AssetFailure::Missing)
+    );
+    let mut expired = body.clone();
+    expired["request_id"] = json!("expired-source");
+    let (s, expired_response) = f.post(&expired).await;
+    assert_eq!(s, StatusCode::GONE);
+    assert_eq!(expired_response["error"]["code"], "source_expired");
+    assert_eq!(f.assets.purge_expired_camera_assets().unwrap(), 2);
+    for extension in ["jpg", "json"] {
+        assert!(
+            !f._dir
+                .path()
+                .join("images")
+                .join(format!("{}.{}", f.camera.asset_id, extension))
+                .exists()
+        );
+    }
     let (s, replay) = f.post(&body).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(replay, r);

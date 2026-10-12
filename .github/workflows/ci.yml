@@ -169,10 +169,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # Downstream test binaries do not inherit item-ingest's linker rpath.
+          export LD_LIBRARY_PATH="$PWD/target/vendor/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           echo "::notice::at test: avutil.h=$(ls target/vendor/ffmpeg/include/libavutil/avutil.h 2>&1)"
           echo "::notice::PWD=$PWD"
           cargo test --workspace --features rtsp 2>&1 | tee test.log || {
             # gcc/cl error lines are prefixed by file:line:, so don't anchor ^
-            grep -aiE "fatal error|no such file|undefined reference|cannot find|error\[|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
+            grep -aiE "fatal error|no such file|undefined reference|cannot find|shared libraries|shared object|error\[|panicked|FAILED" test.log | head -25 | sed 's/^/::error::/'
             grep -aE "rustc-link-search|FFMPEG_DIR" test.log | head -6 | sed 's/^/::error::search:/'
             tail -30 test.log | sed 's/^/::error::/' ; exit 1; }

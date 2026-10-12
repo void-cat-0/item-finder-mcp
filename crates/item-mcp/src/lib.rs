@@ -88,7 +88,7 @@ impl ItemMcpServer {
 #[tool_router]
 impl ItemMcpServer {
     #[tool(
-        description = "Validate the Item Finders MCP connection. Returns server identity and query/camera-frame mode, not daemon health. Use get_health for daemon status. Image tools require an authenticated local daemon. get_camera_frame freezes an expiring immutable JPEG; it does not create an observation.",
+        description = "Validate the Item Finder MCP connection. Returns server identity and query/camera-frame mode, not daemon health. Use get_health for daemon status. Image tools require an authenticated local daemon. get_camera_frame freezes an expiring immutable JPEG; it does not create an observation.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

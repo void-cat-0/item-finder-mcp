@@ -32,7 +32,7 @@
 **Windows PowerShell：**先进入你实际的仓库目录，下面路径仅为占位示例。
 
 ```powershell
-Set-Location 'C:/projects/item-finders-mcp'
+Set-Location 'C:/projects/item-finder-mcp'
 cargo +stable build -p item-mcp
 ```
 
@@ -47,7 +47,7 @@ cargo +stable build -p item-mcp
 构建后由 MCP host 直接启动 executable。stdio 启动参数示例（Windows PowerShell）：
 
 ```powershell
-& 'C:/projects/item-finders-mcp/target/debug/item-mcp.exe' --stdio --db 'C:/projects/item-finders-mcp/data/items.db'
+& 'C:/projects/item-finder-mcp/target/debug/item-mcp.exe' --stdio --db 'C:/projects/item-finder-mcp/data/items.db'
 ```
 这是给 host 使用的入口；直接启动会等待 stdin 上的 MCP JSON-RPC，不是交互式寻物 CLI。
 `--stdio` 可省略；stdout 只承载 MCP 消息，日志在 stderr；连接初始化后关闭 stdin 可结束 server。
@@ -80,10 +80,10 @@ DB 缺失/不可读返回 `database_unavailable`，不是成功的空列表。
 {
   "mcp": {
     "servers": {
-      "item-finders-mcp": {
+      "item-finder-mcp": {
         "type": "stdio",
-        "command": "C:/projects/item-finders-mcp/target/debug/item-mcp.exe",
-        "args": ["--stdio", "--db", "C:/projects/item-finders-mcp/data/items.db"]
+        "command": "C:/projects/item-finder-mcp/target/debug/item-mcp.exe",
+        "args": ["--stdio", "--db", "C:/projects/item-finder-mcp/data/items.db"]
       }
     }
   }
